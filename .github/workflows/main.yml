@@ -14,21 +14,29 @@ jobs:
 
     runs-on: ubuntu-latest
 
-    # ---- repo/env inputs ----
-
     env:
 
-      CSV_PATH: schedule.csv          # or schedule.xlsx in repo root
+      # File in your repo root. Can be schedule.csv OR schedule.xlsx
+
+      CSV_PATH: schedule.csv
 
       TARGET_ENV: Production
 
       TZ: Asia/Kolkata
 
+      # Secrets to set in GitHub → Settings → Secrets and variables → Actions
+
       AWS_REGION: ${{ secrets.AWS_REGION }}
+
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
 
       TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
 
-      EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}   # optional fallback if not in sheet
+      # Optional fallback if a row doesn't have InstanceId
+
+      EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
 
     steps:
 
@@ -36,55 +44,17 @@ jobs:
 
         uses: actions/checkout@v4
 
-      # ---- AWS auth with ACCESS KEYS (no OIDC, no SSH) ----
-
       - name: Configure AWS credentials
 
         uses: aws-actions/configure-aws-credentials@v4
 
         with:
 
-          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}
 
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
 
-          aws-region:            ${{ secrets.AWS_REGION }}
-
-      # ---- Install AWS CLI to use aws ssm ... in the next step ----
-
-      - name: Install AWS CLI
-
-        run: |
-
-          sudo apt-get update -y
-
-          sudo apt-get install -y awscli
-
-          aws --version
-
-      # ---- Optional: fail early if instance is not Online in SSM ----
-
-      - name: Verify instance is Online in SSM
-
-        env:
-
-          IID: ${{ secrets.EC2_INSTANCE_ID }}
-
-        run: |
-
-          test -n "$IID" || { echo "EC2_INSTANCE_ID secret not set"; exit 1; }
-
-          status=$(aws ssm describe-instance-information --region "$AWS_REGION" --query "InstanceInformationList[?InstanceId=='$IID'].PingStatus|[0]" --output text)
-
-          echo "SSM PingStatus for $IID: $status"
-
-          if [ "$status" != "Online" ]; then
-
-            echo "Instance is not Online in SSM. Check SSM agent/role/network."; exit 1
-
-          fi
-
-      # ---- Python & libs ----
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: Setup Python
 
@@ -101,8 +71,6 @@ jobs:
           python -m pip install --upgrade pip
 
           pip install boto3 requests pandas openpyxl pytz
-
-      # ---- Create the normalized, error-tolerant script ----
 
       - name: Create SSM patching script
 
@@ -134,7 +102,9 @@ jobs:
 
           def post_teams(message: str, level: str = "Info"):
 
-              if not TEAMS_URL: return
+              if not TEAMS_URL: 
+
+                  return
 
               payload = {
 
@@ -142,11 +112,11 @@ jobs:
 
                   "@context": "http://schema.org/extensions",
 
-                  "themeColor": "0076D7" if level.lower() == "info" else "FF0000",
+                  "themeColor": "0076D7" if level.lower()=="info" else "FF0000",
 
                   "summary": f"{level}: {message}",
 
-                  "sections": [{"activityTitle": f"**{level}**", "text": message}],
+                  "sections": [{ "activityTitle": f"**{level}**", "text": message }],
 
               }
 
@@ -167,6 +137,8 @@ jobs:
               s = re.sub(r"_{2,}", "_", s).strip("_")
 
               return s
+
+          # Flexible header aliases
 
           ALIASES = {
 
@@ -200,25 +172,27 @@ jobs:
 
           def require(row: dict, field: str) -> str:
 
-              val = first_nonempty(row, ALIASES[field])
+              v = first_nonempty(row, ALIASES[field])
 
-              if not val:
+              if not v:
 
                   raise ValueError(f"Missing required field: {field} (accepted: {ALIASES[field]})")
 
-              return val
+              return v
 
           def parse_dt(s: str, tz):
 
               s = (s or "").strip()
 
-              for fmt in ("%d-%m-%Y %H:%M:%S", "%d-%m-%Y %H:%M",
+              for fmt in ("%d-%m-%Y %H:%M:%S","%d-%m-%Y %H:%M","%Y-%m-%d %H:%M:%S","%Y-%m-%d %H:%M"):
 
-                          "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+                  try:
 
-                  try: return tz.localize(datetime.strptime(s, fmt))
+                      return tz.localize(datetime.strptime(s, fmt))
 
-                  except: pass
+                  except:
+
+                      pass
 
               raise ValueError(f"Bad date '{s}'. Use 'DD-MM-YYYY HH:MM' or 'YYYY-MM-DD HH:MM'")
 
@@ -246,6 +220,8 @@ jobs:
 
           def ssm_run(instance_id: str, command: str, timeout_s: int = 180):
 
+              """Run a shell command on EC2 via SSM and wait for completion."""
+
               try:
 
                   resp = ssm.send_command(
@@ -266,11 +242,11 @@ jobs:
 
                       out = ssm.get_command_invocation(CommandId=cmd_id, InstanceId=instance_id)
 
-                      if out["Status"] in ("Success", "Failed", "Cancelled", "TimedOut"):
+                      if out["Status"] in ("Success","Failed","Cancelled","TimedOut"):
 
                           code = int(out.get("ResponseCode", 1))
 
-                          return code, out.get("StandardOutputContent", ""), out.get("StandardErrorContent", "")
+                          return code, out.get("StandardOutputContent",""), out.get("StandardErrorContent","")
 
                       time.sleep(1)
 
@@ -282,13 +258,17 @@ jobs:
 
           def http_status_via_ssm(instance_id: str, url: str):
 
-              if not url: return None, "no url"
+              if not url:
+
+                  return None, "no url"
 
               shell = f'curl -sS -m 8 -w "\\nHTTP_STATUS:%{{http_code}}" "{url}" || true'
 
               code, out, err = ssm_run(instance_id, shell)
 
-              if code != 0: return None, err or out
+              if code != 0:
+
+                  return None, err or out
 
               status = None; body = out
 
@@ -296,11 +276,37 @@ jobs:
 
                   body, tail = out.rsplit("HTTP_STATUS:", 1)
 
-                  try: status = int(tail.strip())
+                  try:
 
-                  except: status = None
+                      status = int(tail.strip())
+
+                  except:
+
+                      status = None
 
               return status, body
+
+          def ensure_online(instance_id: str) -> bool:
+
+              """Quick check that instance is managed/online in SSM."""
+
+              try:
+
+                  resp = ssm.describe_instance_information(
+
+                      Filters=[{"Key":"InstanceIds","Values":[instance_id]}]
+
+                  )
+
+                  if resp["InstanceInformationList"]:
+
+                      return resp["InstanceInformationList"][0]["PingStatus"] == "Online"
+
+              except Exception as e:
+
+                  print(f"[ssm] online check failed: {e}")
+
+              return False
 
           def main():
 
@@ -340,9 +346,9 @@ jobs:
 
                       stop  = parse_dt(require(raw, "stop"), tz)
 
-                      cmd = require(raw, "cmd")
+                      cmd   = require(raw, "cmd")
 
-                      iid = first_nonempty(raw, ALIASES["instanceid"]) or FALLBACK_IID
+                      iid   = first_nonempty(raw, ALIASES["instanceid"]) or FALLBACK_IID
 
                       if not iid:
 
@@ -352,11 +358,19 @@ jobs:
 
                       any_action = True
 
+                      if not ensure_online(iid):
+
+                          post_teams(f"❌ {app}: Instance {iid} not Online in SSM", "Alert")
+
+                          continue
+
                       if start <= now <= stop:
+
+                          # inside window → stop
 
                           stop_cmd = cmd.replace("start", "stop")
 
-                          post_teams(f"🛑 Patching window active for **{app}** on {iid} – `{stop_cmd}`", "Info")
+                          post_teams(f"🛑 Patching window active for **{app}** on `{iid}` – `{stop_cmd}`", "Info")
 
                           rc, out, err = ssm_run(iid, stop_cmd)
 
@@ -368,7 +382,9 @@ jobs:
 
                       else:
 
-                          post_teams(f"▶️ Starting **{app}** on {iid} – `{cmd}`", "Info")
+                          # outside window → (re)start + health
+
+                          post_teams(f"▶️ Starting **{app}** on `{iid}` – `{cmd}`", "Info")
 
                           rc, out, err = ssm_run(iid, cmd)
 
@@ -418,7 +434,7 @@ jobs:
 
           PY
 
-      - name: Run windowed patching via SSM
+      - name: Run patching via SSM
 
         run: python windowed_health_check_ssm.py
  
