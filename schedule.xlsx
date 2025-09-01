@@ -1,3 +1,0 @@
-App Name	Start Date	Stop Date	Environment	Owner	health URL	HOST	Command
-HealthCheckApp	01-09-2025 08:00	01-09-2025 20:00	Production	Porselvi Baskar	56.228.6.225:3000/health	56.228.6.225	 docker start f88643e26d64
-HealthCheckApp	02-09-2025 08:00	02-09-2025 20:00	Production	Porselvi Baskar	56.228.6.225:3000/health	56.228.6.225	 docker start f88643e26d64
