@@ -1,4 +1,4 @@
-name: Patching Control (SSM) + Teams (no SSH keys)
+name: Patching Control (SSM) + Teams
 
 on:
 
@@ -6,7 +6,7 @@ on:
 
   schedule:
 
-    - cron: "*/5 * * * *"   # every 5 minutes
+    - cron: "*/5 * * * *"
 
 jobs:
 
@@ -28,11 +28,9 @@ jobs:
 
     steps:
 
-      - name: Checkout
+      - uses: actions/checkout@v4
 
-        uses: actions/checkout@v4
-
-      # ---- AuthN to AWS (OIDC recommended) ----
+      # Authenticate to AWS via OIDC (preferred). If you use access keys, see note below.
 
       - name: Configure AWS credentials (OIDC)
 
@@ -44,21 +42,7 @@ jobs:
 
           aws-region: ${{ secrets.AWS_REGION }}
 
-      # (If you prefer access keys instead of OIDC, replace the step above with:)
-
-      # - name: Configure AWS credentials (keys)
-
-      #   uses: aws-actions/configure-aws-credentials@v4
-
-      #   with:
-
-      #     aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
-
-      #     aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-
-      #     aws-region:            ${{ secrets.AWS_REGION }}
-
-      - name: Verify SSM online
+      - name: Verify instance is Online in SSM
 
         env:
 
@@ -68,31 +52,21 @@ jobs:
 
           set -e
 
-          echo "Checking SSM registration for $IID in $AWS_REGION"
-
-          aws ssm describe-instance-information --region "$AWS_REGION" \
-
-            --query "InstanceInformationList[?InstanceId=='$IID'].[InstanceId,PingStatus]" \
-
-            --output table
-
-          # Optional hard fail if not Online:
-
           status=$(aws ssm describe-instance-information --region "$AWS_REGION" \
 
             --query "InstanceInformationList[?InstanceId=='$IID'].PingStatus|[0]" --output text)
 
+          echo "SSM PingStatus: $status"
+
           if [ "$status" != "Online" ]; then
 
-            echo "Instance is not Online in SSM. Ensure SSM Agent is installed/running and role attached."
+            echo "Instance not Online in SSM. Ensure SSM agent running + IAM role attached."
 
             exit 1
 
           fi
 
-      - name: Setup Python
-
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
 
         with:
 
@@ -106,7 +80,7 @@ jobs:
 
           pip install boto3 requests pandas openpyxl pytz
 
-      - name: Create SSM patching script
+      - name: Create SSM script
 
         run: |
 
@@ -130,6 +104,8 @@ jobs:
 
           AWS_REGION = os.getenv("AWS_REGION")
 
+          FALLBACK_IID = os.getenv("EC2_INSTANCE_ID","").strip()
+
           ssm = boto3.client("ssm", region_name=AWS_REGION)
 
           def post_teams(message, level="Info"):
@@ -138,25 +114,19 @@ jobs:
 
               payload = {
 
-                  "@type": "MessageCard",
+                  "@type":"MessageCard","@context":"http://schema.org/extensions",
 
-                  "@context": "http://schema.org/extensions",
+                  "themeColor":"0076D7" if level.lower()=="info" else "FF0000",
 
-                  "themeColor": "0076D7" if level.lower()=="info" else "FF0000",
+                  "summary":f"{level}: {message}",
 
-                  "summary": f"{level}: {message}",
-
-                  "sections": [{"activityTitle": f"**{level}**", "text": message}]
+                  "sections":[{"activityTitle":f"**{level}**","text":message}]
 
               }
 
-              try:
+              try: requests.post(TEAMS_URL, json=payload, timeout=10)
 
-                  requests.post(TEAMS_URL, json=payload, timeout=10)
-
-              except Exception as e:
-
-                  print("Teams send failed:", e)
+              except Exception as e: print("Teams send failed:", e)
 
           def parse_dt(s, tz):
 
@@ -164,13 +134,9 @@ jobs:
 
               for f in ("%d-%m-%Y %H:%M:%S","%d-%m-%Y %H:%M","%Y-%m-%d %H:%M:%S","%Y-%m-%d %H:%M"):
 
-                  try:
+                  try: return tz.localize(datetime.strptime(s, f))
 
-                      return tz.localize(datetime.strptime(s, f))
-
-                  except Exception:
-
-                      pass
+                  except: pass
 
               raise ValueError(f"Bad date: {s}")
 
@@ -178,23 +144,17 @@ jobs:
 
               ext = os.path.splitext(path)[1].lower()
 
-              if ext == ".csv":
+              if ext == ".csv": df = pd.read_csv(path)
 
-                  df = pd.read_csv(path)
+              elif ext in (".xlsx",".xls"): df = pd.read_excel(path)
 
-              elif ext in (".xlsx", ".xls"):
-
-                  df = pd.read_excel(path)
-
-              else:
-
-                  raise ValueError("Use CSV or XLSX")
+              else: raise ValueError("Use CSV or XLSX")
 
               df.columns = [c.strip().lower() for c in df.columns]
 
               return df.to_dict("records")
 
-          def ssm_run(instance_id, command, timeout_s=120):
+          def ssm_run(instance_id, command, timeout_s=180):
 
               resp = ssm.send_command(
 
@@ -202,7 +162,7 @@ jobs:
 
                   DocumentName="AWS-RunShellScript",
 
-                  Parameters={"commands": [command]},
+                  Parameters={"commands":[command]},
 
                   CloudWatchOutputConfig={"CloudWatchOutputEnabled": False},
 
@@ -210,7 +170,7 @@ jobs:
 
               cmd_id = resp["Command"]["CommandId"]
 
-              # poll for completion
+              # poll
 
               for _ in range(timeout_s):
 
@@ -218,7 +178,7 @@ jobs:
 
                   if out["Status"] in ("Success","Failed","Cancelled","TimedOut"):
 
-                      code = int(out.get("ResponseCode", 1))
+                      code = int(out.get("ResponseCode",1))
 
                       return code, out.get("StandardOutputContent",""), out.get("StandardErrorContent","")
 
@@ -230,23 +190,17 @@ jobs:
 
               shell = f'curl -sS -m 8 -w "\\nHTTP_STATUS:%{{http_code}}" "{url}" || true'
 
-              code, out, err = ssm_run(instance_id, shell, timeout_s=180)
+              code, out, err = ssm_run(instance_id, shell)
 
-              if code != 0:
+              if code != 0: return None, f"curl failed: {err or out}"
 
-                  return None, f"curl failed: {err or out}"
-
-              status = None
-
-              body = out
+              status = None; body = out
 
               if "HTTP_STATUS:" in out:
 
-                  parts = out.rsplit("HTTP_STATUS:", 1)
+                  body, tail = out.rsplit("HTTP_STATUS:", 1)
 
-                  body = parts[0].strip()
-
-                  try: status = int(parts[1].strip())
+                  try: status = int(tail.strip())
 
                   except: status = None
 
@@ -260,81 +214,57 @@ jobs:
 
               print(f"Now: {now}  TZ={TZ_NAME}")
 
-              fallback_iid = os.getenv("EC2_INSTANCE_ID", "").strip()
+              for r in load_rows(CSV_PATH):
 
-              for raw in load_rows(CSV_PATH):
+                  app = (r.get("app name") or r.get("appname") or "").strip()
 
-                  # normalize keys
+                  env = (r.get("environment") or "").strip()
 
-                  app   = (raw.get("app name") or raw.get("appname") or "").strip()
-
-                  env   = (raw.get("environment") or "").strip()
-
-                  if not app or env != TARGET_ENV:
-
-                      continue
+                  if not app or env != TARGET_ENV: continue
 
                   try:
 
-                      start = parse_dt(raw.get("start date"), tz)
+                      start = parse_dt(r.get("start date"), tz)
 
-                      stop  = parse_dt(raw.get("stop date"), tz)
+                      stop  = parse_dt(r.get("stop date"), tz)
 
                   except Exception as e:
 
-                      print(f"[{app}] bad date: {e} — skipping")
+                      print(f"[{app}] bad date: {e}"); continue
 
-                      continue
+                  url = (r.get("health url") or "").strip()
 
-                  url   = (raw.get("health url") or "").strip()
+                  cmd = (r.get("command") or "").strip()
 
-                  cmd   = (raw.get("command") or "").strip()
+                  iid = (r.get("instanceid") or FALLBACK_IID or "").strip()
 
-                  iid   = (raw.get("instanceid") or fallback_iid or "").strip()
+                  if not iid or not cmd:
 
-                  if not iid:
-
-                      print(f"[{app}] no InstanceId, skipping")
-
-                      continue
-
-                  if not cmd:
-
-                      print(f"[{app}] no Command, skipping")
-
-                      continue
+                      print(f"[{app}] missing InstanceId or Command; skipping"); continue
 
                   if start <= now <= stop:
 
-                      # Inside window: STOP (replace 'start' with 'stop' in command)
+                      stop_cmd = cmd.replace("start","stop")
 
-                      stop_cmd = cmd.replace("start", "stop")
+                      post_teams(f"🛑 Patching started for **{app}** on {iid} – `{stop_cmd}`","Info")
 
-                      post_teams(f"🛑 Patching started for **{app}** on {iid} – running `{stop_cmd}`", "Info")
-
-                      rc, out, err = ssm_run(iid, stop_cmd)
+                      rc,out,err = ssm_run(iid, stop_cmd)
 
                       print(f"[{app}] stop rc={rc} out={out} err={err}")
 
-                      if rc != 0:
-
-                          post_teams(f"❌ Failed to stop {app}: {err or out}", "Alert")
+                      if rc != 0: post_teams(f"❌ Failed to stop {app}: {err or out}","Alert")
 
                   else:
 
-                      # Outside window: START then health check
+                      post_teams(f"▶️ Starting **{app}** on {iid} – `{cmd}`","Info")
 
-                      post_teams(f"▶️ Starting **{app}** on {iid} – `{cmd}`", "Info")
-
-                      rc, out, err = ssm_run(iid, cmd)
+                      rc,out,err = ssm_run(iid, cmd)
 
                       print(f"[{app}] start rc={rc} out={out} err={err}")
 
                       if rc != 0:
 
-                          post_teams(f"❌ Failed to start {app}: {err or out}", "Alert")
-
-                          continue
+                          post_teams(f"❌ Failed to start {app}: {err or out}","Alert"); continue
 
                       time.sleep(8)
 
@@ -344,13 +274,9 @@ jobs:
 
                           print(f"[{app}] health {status}")
 
-                          if status == 200:
+                          if status == 200: post_teams(f"✅ {app} healthy after patching","Info")
 
-                              post_teams(f"✅ {app} healthy after patching", "Info")
-
-                          else:
-
-                              post_teams(f"❌ {app} NOT healthy after patching (status {status})", "Alert")
+                          else: post_teams(f"❌ {app} NOT healthy after patching (status {status})","Alert")
 
           if __name__ == "__main__":
 
