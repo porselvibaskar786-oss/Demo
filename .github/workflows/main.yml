@@ -39,12 +39,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests paramiko pytz
 
-      - name: Write SSH key
+          - name: Write SSH key
         run: |
           mkdir -p ~/.ssh
           echo "${SSH_KEY}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
+          ssh-keygen -y -f ~/.ssh/id_rsa > ~/.ssh/id_rsa.pub || true
           printf "Host *\n  StrictHostKeyChecking no\n" > ~/.ssh/config
+
 
       - name: Create script
         run: |
@@ -89,7 +91,11 @@ jobs:
               raise ValueError(f"Bad date: {s}")
 
           def ssh_run(host, cmd):
-              k = paramiko.RSAKey.from_private_key_file(os.path.expanduser("~/.ssh/id_rsa"))
+              try:
+    k = paramiko.RSAKey.from_private_key_file(os.path.expanduser("~/.ssh/id_rsa"))
+except paramiko.ssh_exception.SSHException:
+    k = paramiko.Ed25519Key.from_private_key_file(os.path.expanduser("~/.ssh/id_rsa"))
+
               c = paramiko.SSHClient()
               c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
               c.connect(hostname=host, username=SSH_USER, port=SSH_PORT, pkey=k, timeout=15)
