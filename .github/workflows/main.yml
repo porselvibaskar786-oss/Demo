@@ -18,7 +18,7 @@ jobs:
 
       # Excel file path (yours is at repo root)
 
-      EXCEL_PATH: "schedule.xlsx.csv"
+      EXCEL_PATH: "schedule.csv"
 
       TARGET_ENV: "Production"
 
