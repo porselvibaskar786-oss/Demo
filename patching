@@ -1,0 +1,97 @@
+name: Docker App Health Check & Notification
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"  # Every 5 minutes
+  workflow_dispatch:
+
+jobs:
+  health-check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install pandas openpyxl requests
+
+      - name: Run health check and notify Teams
+        env:
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_KEY: ${{ secrets.EC2_KEY }}
+        run: |
+          echo "$EC2_KEY" > key.pem
+          chmod 600 key.pem
+
+          python3 <<EOF
+          import pandas as pd
+          from datetime import datetime
+          import requests, subprocess
+
+          df = pd.read_excel("schedule.xlsx")
+          now = datetime.now()
+          HEALTH_CHECK_URL = "http://${{ secrets.EC2_HOST }}:3000/health"
+
+          try:
+              response_code = requests.get(HEALTH_CHECK_URL).status_code
+          except Exception:
+              response_code = None
+
+          for _, row in df.iterrows():
+              app_name = row['App Name']
+              start = pd.to_datetime(row['Start Date'])
+              stop = pd.to_datetime(row['Stop Date'])
+
+              if start <= now <= stop:
+                  patching_status = "🛑 App should be stopped (patching in progress)"
+                  docker_cmd = "docker stop healthcheck-app"
+              else:
+                  patching_status = "✅ App should be running (patching completed)"
+                  docker_cmd = "docker start healthcheck-app"
+
+              subprocess.run([
+                  "ssh", "-i", "key.pem",
+                  f"${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }}",
+                  docker_cmd
+              ])
+
+              if response_code == 200:
+                  health_status = "✅ App is healthy"
+              elif response_code is None:
+                  health_status = "❌ Health check failed to connect"
+              else:
+                  health_status = f"❌ App health check returned status code {response_code}"
+
+              message = f"{app_name}:\\n{patching_status}\\n{health_status}"
+
+              teams_payload = {
+                  "@type": "MessageCard",
+                  "@context": "http://schema.org/extensions",
+                  "summary": f"{app_name} Status",
+                  "themeColor": "00FF00" if response_code == 200 else "FF0000",
+                  "title": f"{app_name} Health & Patching Status",
+                  "sections": [{
+                      "facts": [
+                          {"name": "App", "value": app_name},
+                          {"name": "Time", "value": now.strftime("%Y-%m-%d %H:%M:%S")},
+                          {"name": "Patching Status", "value": patching_status},
+                          {"name": "Health Check", "value": health_status}
+                      ],
+                      "text": "Automated status update from GitHub Actions."
+                  }]
+              }
+
+              requests.post(
+                  url="${{ secrets.TEAMS_WEBHOOK_URL }}",
+                  headers={"Content-Type": "application/json"},
+                  json=teams_payload
+              )
+          EOF
