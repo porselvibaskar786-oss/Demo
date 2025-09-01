@@ -131,3 +131,37 @@ jobs:
                       host = (row.get("host") or "").strip()
                       url  = (row.get("health url") or "").strip()
                       stop_cmd = (row.get("stop command") or f"docker stop {app.lower()}").strip()
+                      start_cmd = (row.get("start command") or f"docker start {app.lower()}").strip()
+
+                      if start <= now <= stop:
+                          print(f"[{app}] inside patching window – stopping container")
+                          post_teams(f"⏳ Patching started for **{app}** – stopping Docker...", "Info")
+                          try:
+                              rc, out, err = ssh_run(host, stop_cmd)
+                              print(f"[{app}] stop exit={rc} out={out} err={err}")
+                          except Exception as e:
+                              post_teams(f"❌ Failed to stop {app}: {e}", "Alert")
+                      else:
+                          print(f"[{app}] outside patching window – starting container and checking health")
+                          try:
+                              rc, out, err = ssh_run(host, start_cmd)
+                              print(f"[{app}] start exit={rc} out={out} err={err}")
+                              post_teams(f"▶️ Restarted {app} after patching window", "Info")
+                          except Exception as e:
+                              post_teams(f"❌ Failed to restart {app}: {e}", "Alert")
+                              continue
+
+                          time.sleep(8)
+                          code = http_status(url)
+                          print(f"[{app}] health status after restart: {code}")
+                          if code == 200:
+                              post_teams(f"✅ {app} is healthy after patching", "Info")
+                          else:
+                              post_teams(f"❌ {app} is NOT healthy after patching (status {code})", "Alert")
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+      - name: Run windowed health check
+        run: python windowed_health_check.py
