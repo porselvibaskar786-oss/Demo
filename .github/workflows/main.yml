@@ -224,9 +224,9 @@ jobs:
 
                   try:
 
-                      start = parse_dt(r.get("start date"), tz)
+                      start = parse_dt(r.get("Start date"), tz)
 
-                      stop  = parse_dt(r.get("stop date"), tz)
+                      stop  = parse_dt(r.get("Stop date"), tz)
 
                   except Exception as e:
 
