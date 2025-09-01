@@ -1,4 +1,4 @@
-name: Windowed Health Check & Auto-Restart 
+name: Windowed Health Check & Auto-Restart
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      FILE_PATH: "schedule.csv"
+      FILE_PATH: "schedule.csv"       # or .xlsx
       TARGET_ENV: "Production"
       TZ: "Asia/Kolkata"
 
@@ -34,7 +34,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests paramiko pytz
+          pip install pandas openpyxl requests paramiko pytz
 
       - name: Write SSH key
         if: env.SSH_KEY != ''
@@ -50,6 +50,7 @@ jobs:
           import os, time, csv
           from datetime import datetime
           import requests, paramiko, pytz
+          import pandas as pd
 
           FILE_PATH = os.getenv("FILE_PATH", "schedule.csv")
           TARGET_ENV = os.getenv("TARGET_ENV", "Production")
@@ -99,52 +100,66 @@ jobs:
               try: return requests.get(url, timeout=8).status_code
               except Exception: return None
 
+          def load_rows(path):
+              ext = os.path.splitext(path)[1].lower()
+              if ext == ".csv":
+                  with open(path, newline='', encoding='utf-8') as f:
+                      for row in csv.DictReader(f):
+                          yield row
+              elif ext in (".xlsx", ".xlsm", ".xltx", ".xltm"):
+                  df = pd.read_excel(path, engine="openpyxl")
+                  df = df.where(pd.notna(df), None)
+                  for row in df.to_dict(orient="records"):
+                      yield {k: (v if v is not None else "") for k, v in row.items()}
+              else:
+                  raise ValueError(f"Unsupported file type: {ext}")
+
           def main():
               tz = pytz.timezone(TZ)
               now = datetime.now(tz)
               print(f"Now: {now}  TZ={TZ}")
-              with open(FILE_PATH, newline='', encoding='utf-8') as f:
-                  reader = csv.DictReader(f)
-                  for row in reader:
-                      app   = row.get("App Name", "").strip()
-                      env   = row.get("Environment", "").strip()
-                      if not app or env != TARGET_ENV: continue
-                      start = parse_dt(row.get("Start Date"), tz)
-                      stop  = parse_dt(row.get("Stop Date"), tz)
-                      if not (start <= now <= stop):
-                          print(f"[{app}] outside window ({start} to {stop}) – skip")
-                          post_teams(f"⏹️ Patching window ended for {app} ({stop})")
-                          continue
-                      host  = row.get("HOST", "").strip()
-                      url   = row.get("health URL", "").strip()
-                      rcmd  = row.get("Command", "").strip()
-                      post_teams(f"🔧 Patching started for {app} ({start} to {stop})")
-                      post_dt("CUSTOM_INFO", f"{app}: Patching Started", f"{app} patching window started")
-                      code = http_status(f"http://{url}")
-                      print(f"[{app}] health status: {code}")
-                      if code == 200:
-                          post_teams(f"✅ {app} is healthy")
-                          post_dt("CUSTOM_INFO", f"{app}: Health OK", f"{app} healthy")
-                          continue
-                      post_teams(f"🚨 {app} health failed. Restarting...")
-                      post_dt("CUSTOM_ALERT", f"{app}: Health Failed", f"Status {code}; restarting", status="FAILURE")
-                      try:
-                          rc, out, err = ssh_run(host, rcmd)
-                          print(f"[{app}] restart exit={rc} out={out} err={err}")
-                          post_teams(f"🔁 {app} restart command executed. Exit={rc}")
-                      except Exception as e:
-                          print(f"[{app}] restart error: {e}")
-                          post_teams(f"❌ {app} restart failed: {e}")
-                          continue
-                      time.sleep(8)
-                      code2 = http_status(f"http://{url}")
-                      print(f"[{app}] health after restart: {code2}")
-                      if code2 == 200:
-                          post_teams(f"✅ {app} recovered after restart")
-                          post_dt("CUSTOM_INFO", f"{app}: Recovered", f"{app} recovered")
-                      else:
-                          post_teams(f"🚨 {app} still failing after restart")
-                          post_dt("CUSTOM_ALERT", f"{app}: Still Failing", f"Status {code2}", status="FAILURE")
+              for raw in load_rows(FILE_PATH):
+                  row = { (k or "").strip().lower(): v for k, v in raw.items() }
+                  app = row.get("app name")
+                  env = (row.get("environment") or "").strip()
+                  if not app or env != TARGET_ENV:
+                      continue
+                  start = parse_dt(row.get("start date"), tz)
+                  stop  = parse_dt(row.get("stop date"), tz)
+                  if not (start <= now <= stop):
+                      print(f"[{app}] outside window ({start} to {stop}) – skip")
+                      post_teams(f"⏹️ Patching window ended for {app} ({stop})")
+                      continue
+                  host = (row.get("host") or "").strip()
+                  url  = (row.get("health url") or row.get("health_url") or "").strip()
+                  rcmd = (row.get("command") or row.get("restart command") or "").strip()
+                  post_teams(f"🔧 Patching started for {app} ({start} to {stop})")
+                  post_dt("CUSTOM_INFO", f"{app}: Patching Started", f"{app} patching window started")
+                  code = http_status(f"http://{url}")
+                  print(f"[{app}] health status: {code}")
+                  if code == 200:
+                      post_teams(f"✅ {app} is healthy")
+                      post_dt("CUSTOM_INFO", f"{app}: Health OK", f"{app} healthy")
+                      continue
+                  post_teams(f"🚨 {app} health failed. Restarting...")
+                  post_dt("CUSTOM_ALERT", f"{app}: Health Failed", f"Status {code}; restarting", status="FAILURE")
+                  try:
+                      rc, out, err = ssh_run(host, rcmd)
+                      print(f"[{app}] restart exit={rc} out={out} err={err}")
+                      post_teams(f"🔁 {app} restart command executed. Exit={rc}")
+                  except Exception as e:
+                      print(f"[{app}] restart error: {e}")
+                      post_teams(f"❌ {app} restart failed: {e}")
+                      continue
+                  time.sleep(8)
+                  code2 = http_status(f"http://{url}")
+                  print(f"[{app}] health after restart: {code2}")
+                  if code2 == 200:
+                      post_teams(f"✅ {app} recovered after restart")
+                      post_dt("CUSTOM_INFO", f"{app}: Recovered", f"{app} recovered")
+                  else:
+                      post_teams(f"🚨 {app} still failing after restart")
+                      post_dt("CUSTOM_ALERT", f"{app}: Still Failing", f"Status {code2}", status="FAILURE")
 
           if __name__ == "__main__":
               main()
