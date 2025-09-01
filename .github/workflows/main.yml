@@ -21,8 +21,8 @@ jobs:
       TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
 
       # SSH EC2 (add these secrets in GitHub repo → Settings → Secrets and variables → Actions)
-      SSH_USER: ${{ secrets.SSH_USER }}
-      SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+      SSH_USER: ${{ secrets.EC2_USER }}
+      SSH_KEY: ${{ secrets.EC2_KEY }}
       SSH_PORT: ${{ secrets.SSH_PORT }}
 
     steps:
