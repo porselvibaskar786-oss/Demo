@@ -1,293 +1,127 @@
-name: Patching Control (SSM) + Teams
+name: Patching Control with SSM + Teams
 
 on:
-
   workflow_dispatch:
-
   schedule:
+    - cron: "*/5 * * * *"   # every 5 mins
 
-    - cron: "*/5 * * * *"
+env:
+  CSV_PATH: "schedule.csv"
+  TARGET_ENV: "Production"
+  TZ: "Asia/Kolkata"
+  TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+  AWS_REGION: "eu-central-1"   # change for your region
+  EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
 
 jobs:
-
   patching-check:
-
     runs-on: ubuntu-latest
 
-    env:
-
-      CSV_PATH: "schedule.csv"        # or schedule.xlsx
-
-      TARGET_ENV: "Production"
-
-      TZ: "Asia/Kolkata"
-
-  
-
-      TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
-
     steps:
-
       - uses: actions/checkout@v4
 
-      # Authenticate to AWS via OIDC (preferred). If you use access keys, see note below.
-      
-      - name: Configure AWS credentials (keys)
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-           aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
-           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-           aws-region:            ${{ secrets.AWS_REGION }}    
-
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
 
       - name: Verify instance is Online in SSM
-
-        env:
-
-          IID: ${{ secrets.EC2_INSTANCE_ID }}
-
         run: |
-
           set -e
-
-          status=$(aws ssm describe-instance-information --region "$AWS_REGION" \
-
-            --query "InstanceInformationList[?InstanceId=='$IID'].PingStatus|[0]" --output text)
-
+          status=$(aws ssm describe-instance-information \
+            --region "$AWS_REGION" \
+            --query "InstanceInformationList[?InstanceId=='$EC2_INSTANCE_ID'].PingStatus|[0]" --output text)
           echo "SSM PingStatus: $status"
-
           if [ "$status" != "Online" ]; then
-
-            echo "Instance not Online in SSM. Ensure SSM agent running + IAM role attached."
-
+            echo "❌ Instance not Online in SSM. Ensure SSM agent running + IAM role attached."
             exit 1
-
           fi
 
       - uses: actions/setup-python@v5
-
         with:
-
           python-version: "3.11"
-      
 
-      - name: Install deps
-
+      - name: Install Python dependencies
         run: |
-
           python -m pip install --upgrade pip
+          pip install boto3 requests pandas pytz openpyxl
 
-          pip install boto3 requests pandas openpyxl pytz
-
-      - name: Create SSM script
-
+      - name: Run patching logic inline
         run: |
+          python - <<'PY'
+          import boto3, pandas as pd, requests, pytz, datetime, os, time
 
-          cat > windowed_health_check_ssm.py <<'PY'
-
-          import os, time
-
-          from datetime import datetime
-
-          import requests, boto3, pytz
-
-          import pandas as pd
-
-          CSV_PATH   = os.getenv("CSV_PATH", "schedule.csv")
-
+          # ========= Config =========
+          CSV_PATH = os.getenv("CSV_PATH", "schedule.csv")
           TARGET_ENV = os.getenv("TARGET_ENV", "Production")
-
-          TZ_NAME    = os.getenv("TZ", "Asia/Kolkata")
-
-          TEAMS_URL  = os.getenv("TEAMS_WEBHOOK_URL") or ""
-
-          AWS_REGION = os.getenv("AWS_REGION")
-
-          FALLBACK_IID = os.getenv("EC2_INSTANCE_ID","").strip()
+          TEAMS_WEBHOOK_URL = os.getenv("TEAMS_WEBHOOK_URL")
+          EC2_INSTANCE_ID = os.getenv("EC2_INSTANCE_ID")
+          AWS_REGION = os.getenv("AWS_REGION", "eu-central-1")
+          TZ = pytz.timezone(os.getenv("TZ", "Asia/Kolkata"))
+          MAX_RETRIES, RETRY_DELAY = 3, 15
+          # ==========================
 
           ssm = boto3.client("ssm", region_name=AWS_REGION)
 
-          def post_teams(message, level="Info"):
+          def send_teams_message(message: str):
+              payload = {"text": message}
+              try:
+                  requests.post(TEAMS_WEBHOOK_URL, json=payload)
+              except Exception as e:
+                  print(f"⚠️ Teams send failed: {e}")
 
-              if not TEAMS_URL: return
-
-              payload = {
-
-                  "@type":"MessageCard","@context":"http://schema.org/extensions",
-
-                  "themeColor":"0076D7" if level.lower()=="info" else "FF0000",
-
-                  "summary":f"{level}: {message}",
-
-                  "sections":[{"activityTitle":f"**{level}**","text":message}]
-
-              }
-
-              try: requests.post(TEAMS_URL, json=payload, timeout=10)
-
-              except Exception as e: print("Teams send failed:", e)
-
-          def parse_dt(s, tz):
-
-              s = str(s or "").strip()
-
-              for f in ("%d-%m-%Y %H:%M:%S","%d-%m-%Y %H:%M","%Y-%m-%d %H:%M:%S","%Y-%m-%d %H:%M"):
-
-                  try: return tz.localize(datetime.strptime(s, f))
-
-                  except: pass
-
-              raise ValueError(f"Bad date: {s}")
-
-          def load_rows(path):
-
-              ext = os.path.splitext(path)[1].lower()
-
-              if ext == ".csv": df = pd.read_csv(path)
-
-              elif ext in (".xlsx",".xls"): df = pd.read_excel(path)
-
-              else: raise ValueError("Use CSV or XLSX")
-
-              df.columns = [c.strip().lower() for c in df.columns]
-
-              return df.to_dict("records")
-
-          def ssm_run(instance_id, command, timeout_s=180):
-
+          def run_ssm_command(commands):
               resp = ssm.send_command(
-
-                  InstanceIds=[instance_id],
-
+                  InstanceIds=[EC2_INSTANCE_ID],
                   DocumentName="AWS-RunShellScript",
-
-                  Parameters={"commands":[command]},
-
-                  CloudWatchOutputConfig={"CloudWatchOutputEnabled": False},
-
+                  Parameters={"commands": commands},
               )
+              cid = resp["Command"]["CommandId"]
+              for _ in range(10):
+                  time.sleep(5)
+                  out = ssm.get_command_invocation(CommandId=cid, InstanceId=EC2_INSTANCE_ID)
+                  if out["Status"] in ["Success","Failed","Cancelled","TimedOut"]:
+                      return out
+              return {"Status": "Unknown", "StandardOutputContent": "", "StandardErrorContent": "Timeout"}
 
-              cmd_id = resp["Command"]["CommandId"]
-
-              # poll
-
-              for _ in range(timeout_s):
-
-                  out = ssm.get_command_invocation(CommandId=cmd_id, InstanceId=instance_id)
-
-                  if out["Status"] in ("Success","Failed","Cancelled","TimedOut"):
-
-                      code = int(out.get("ResponseCode",1))
-
-                      return code, out.get("StandardOutputContent",""), out.get("StandardErrorContent","")
-
-                  time.sleep(1)
-
-              return 1, "", "Timed out waiting for SSM command"
-
-          def http_status_via_ssm(instance_id, url):
-
-              shell = f'curl -sS -m 8 -w "\\nHTTP_STATUS:%{{http_code}}" "{url}" || true'
-
-              code, out, err = ssm_run(instance_id, shell)
-
-              if code != 0: return None, f"curl failed: {err or out}"
-
-              status = None; body = out
-
-              if "HTTP_STATUS:" in out:
-
-                  body, tail = out.rsplit("HTTP_STATUS:", 1)
-
-                  try: status = int(tail.strip())
-
-                  except: status = None
-
-              return status, body
+          def check_app_health(url="http://localhost:5000/health"):
+              for attempt in range(1, MAX_RETRIES+1):
+                  try:
+                      r = requests.get(url, timeout=5)
+                      if r.status_code == 200:
+                          return True
+                  except Exception: pass
+                  print(f"⚠️ Health check attempt {attempt} failed")
+                  time.sleep(RETRY_DELAY)
+              return False
 
           def main():
-
-              tz = pytz.timezone(TZ_NAME)
-
-              now = datetime.now(tz)
-
-              print(f"Now: {now}  TZ={TZ_NAME}")
-
-              for r in load_rows(CSV_PATH):
-
-                  app = (r.get("app name") or r.get("appname") or "").strip()
-
-                  env = (r.get("environment") or "").strip()
-
-                  if not app or env != TARGET_ENV: continue
-
-                  try:
-
-                      start = parse_dt(r.get("start date"), tz)
-
-                      stop  = parse_dt(r.get("stop date"), tz)
-
-                  except Exception as e:
-
-                      print(f"[{app}] bad date: {e}"); continue
-
-                  url = (r.get("health url") or "").strip()
-
-                  cmd = (r.get("command") or "").strip()
-
-                  iid = (r.get("instanceid") or FALLBACK_IID or "").strip()
-
-                  if not iid or not cmd:
-
-                      print(f"[{app}] missing InstanceId or Command; skipping"); continue
+              now = datetime.datetime.now(TZ)
+              df = pd.read_csv(CSV_PATH)
+              for _, row in df.iterrows():
+                  start = TZ.localize(pd.to_datetime(row["start"]))
+                  stop  = TZ.localize(pd.to_datetime(row["stop"]))
+                  env   = row.get("env","Production")
+                  if env != TARGET_ENV: continue
 
                   if start <= now <= stop:
+                      send_teams_message("⚠️ Patching window started. Stopping Docker...")
+                      res = run_ssm_command(["docker stop $(docker ps -q) || true"])
+                      send_teams_message(f"🔻 Docker stop result: {res['Status']}")
+                      return
 
-                      stop_cmd = cmd.replace("start","stop")
-
-                      post_teams(f"🛑 Patching started for **{app}** on {iid} – `{stop_cmd}`","Info")
-
-                      rc,out,err = ssm_run(iid, stop_cmd)
-
-                      print(f"[{app}] stop rc={rc} out={out} err={err}")
-
-                      if rc != 0: post_teams(f"❌ Failed to stop {app}: {err or out}","Alert")
-
-                  else:
-
-                      post_teams(f"▶️ Starting **{app}** on {iid} – `{cmd}`","Info")
-
-                      rc,out,err = ssm_run(iid, cmd)
-
-                      print(f"[{app}] start rc={rc} out={out} err={err}")
-
-                      if rc != 0:
-
-                          post_teams(f"❌ Failed to start {app}: {err or out}","Alert"); continue
-
-                      time.sleep(8)
-
-                      if url:
-
-                          status, body = http_status_via_ssm(iid, url)
-
-                          print(f"[{app}] health {status}")
-
-                          if status == 200: post_teams(f"✅ {app} healthy after patching","Info")
-
-                          else: post_teams(f"❌ {app} NOT healthy after patching (status {status})","Alert")
+                  if now > stop:
+                      send_teams_message("✅ Patching ended. Restarting Docker...")
+                      res = run_ssm_command(["docker start $(docker ps -aq) || true"])
+                      if check_app_health():
+                          send_teams_message("🟢 App is healthy after restart ✅")
+                      else:
+                          send_teams_message("❌ App health check failed ❌")
+                      return
 
           if __name__ == "__main__":
-
               main()
-
           PY
 
-      - name: Run windowed patching via SSM
-
-        env:
-
-          EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
-
-        run: python windowed_health_check_ssm.py
- 
