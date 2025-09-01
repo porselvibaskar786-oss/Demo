@@ -39,13 +39,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests paramiko pytz
 
-          - name: Write SSH key
+      - name: Write SSH key
         run: |
           mkdir -p ~/.ssh
           echo "${SSH_KEY}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
           ssh-keygen -y -f ~/.ssh/id_rsa > ~/.ssh/id_rsa.pub || true
           printf "Host *\n  StrictHostKeyChecking no\n" > ~/.ssh/config
+
+      - name: Debug SSH key type
+        run: |
+         ssh-keygen -lf ~/.ssh/id_rsa || echo "Invalid key format"
+
 
 
       - name: Create script
