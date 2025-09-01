@@ -22,7 +22,7 @@ jobs:
 
       TZ: "Asia/Kolkata"
 
-      AWS_REGION: ${{ secrets.AWS_REGION }}
+  
 
       TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
 
@@ -32,15 +32,6 @@ jobs:
 
       # Authenticate to AWS via OIDC (preferred). If you use access keys, see note below.
 
-      - name: Configure AWS credentials (OIDC)
-
-        uses: aws-actions/configure-aws-credentials@v4
-
-        with:
-
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-
-          aws-region: ${{ secrets.AWS_REGION }}
 
       - name: Verify instance is Online in SSM
 
