@@ -81,16 +81,21 @@ jobs:
           cat > windowed_health_check.py <<'PY'
 
           import os, time
-          import csv
+          import pandas as pd
 
           from datetime import datetime
 
           import requests, paramiko, pytz
 
-          from openpyxl import load_workbook
-
           EXCEL_PATH = os.getenv("EXCEL_PATH","schedule.csv")
 
+          if  EXCEL_PATH.endswith(".csv"):
+            df = pd.read_csv(EXCEL_PATH)
+          else:
+            import openpyxl
+            df = pd.read_excel(EXCEL_PATH)
+          print(df.head())  
+          
           TARGET_ENV = os.getenv("TARGET_ENV","Production")
 
           TZ = os.getenv("TZ","Asia/Kolkata")
