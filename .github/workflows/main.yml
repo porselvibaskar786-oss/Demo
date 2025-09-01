@@ -1,4 +1,4 @@
-name: Windowed Health Check & Auto-Restart
+name: Windowed Health Check & Auto-Restart 
 
 on:
   workflow_dispatch:
