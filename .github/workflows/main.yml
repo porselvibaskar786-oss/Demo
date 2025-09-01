@@ -50,6 +50,42 @@ jobs:
       - name: Debug SSH key type
         run: |
          ssh-keygen -lf ~/.ssh/id_rsa || echo "Invalid key format"
+         - name: Write SSH key (normalize + permissions)
+ run: |
+   set -e
+   mkdir -p ~/.ssh
+   # Write the secret verbatim; avoids YAML quoting issues
+   cat > ~/.ssh/id_rsa <<'KEY'
+   ${{ secrets.SSH_KEY }}
+   KEY
+   # Fix Windows CRLF if secret was pasted from Windows
+   sed -i 's/\r$//' ~/.ssh/id_rsa
+   chmod 600 ~/.ssh/id_rsa
+   printf "Host *\n  StrictHostKeyChecking no\n  BatchMode yes\n" > ~/.ssh/config
+- name: Inspect key format (safe)
+ run: |
+   echo "Trying RSA fingerprint..."
+   if ssh-keygen -lf ~/.ssh/id_rsa ; then
+     echo "RSA key parsed OK"
+   else
+     echo "RSA parse failed, trying Ed25519/OpenSSH..."
+     # This will fail if the key isn't Ed25519/OpenSSH
+     ssh-keygen -yf ~/.ssh/id_rsa > /dev/null || true
+   fi
+- name: Derive public key from private (sanity)
+ run: |
+   # If this fails, the private key is malformed
+   ssh-keygen -y -f ~/.ssh/id_rsa > ~/.ssh/id_rsa.pub
+   echo "Derived public key length: $(wc -c < ~/.ssh/id_rsa.pub) bytes"
+# OPTIONAL: confirm network path and user; replace with your values
+- name: Test SSH connectivity (no commands)
+ env:
+   HOST: ${{ secrets.EC2_HOST }}
+   USER: ${{ secrets.EC2_USER }}
+   PORT: ${{ secrets.SSH_PORT }}
+ run: |
+   set -x
+   ssh -vvv -p "${PORT:-22}" "${USER:-ubuntu}@${HOST}" true
 
 
 
