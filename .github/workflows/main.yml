@@ -81,6 +81,7 @@ jobs:
           cat > windowed_health_check.py <<'PY'
 
           import os, time
+          import csv
 
           from datetime import datetime
 
@@ -88,7 +89,7 @@ jobs:
 
           from openpyxl import load_workbook
 
-          EXCEL_PATH = os.getenv("EXCEL_PATH","schedule.xlsx.csv")
+          EXCEL_PATH = os.getenv("EXCEL_PATH","schedule.csv")
 
           TARGET_ENV = os.getenv("TARGET_ENV","Production")
 
@@ -176,11 +177,17 @@ jobs:
 
             now = datetime.now(tz)
 
-            wb = load_workbook(EXCEL_PATH, data_only=True, read_only=True)
-
-            ws = wb.active   # first sheet
-
-            headers = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
+         with open(EXCEL_PATH, newline='') as f:
+   reader = csv.DictReader(f)
+   for row in reader:
+       app = row["App Name"]
+       start = row["Start Date"]
+       stop = row["Stop Date"]
+       env = row["Environment"]
+       host = row["Host"]
+       url = row["Health URL"]
+       rcmd = row["Restart Command"]
+       # then continue same as before
 
             name_to_idx = {h: i for i,h in enumerate(headers)}
 
