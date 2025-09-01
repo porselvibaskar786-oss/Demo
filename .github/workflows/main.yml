@@ -1,4 +1,4 @@
-name: Windowed Health Check & Auto-Restart
+name: Patching Control & Teams Notification
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
     - cron: "*/5 * * * *"   # every 5 minutes
 
 jobs:
-  windowed-health:
+  patching-check:
     runs-on: ubuntu-latest
     env:
       CSV_PATH: "schedule.csv"
@@ -20,7 +20,7 @@ jobs:
       # Microsoft Teams webhook
       TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
 
-      # SSH EC2 (add these secrets)
+      # SSH EC2 (add these secrets in GitHub repo → Settings → Secrets and variables → Actions)
       SSH_USER: ${{ secrets.SSH_USER }}
       SSH_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
       SSH_PORT: ${{ secrets.SSH_PORT }}
@@ -57,38 +57,31 @@ jobs:
           TARGET_ENV = os.getenv("TARGET_ENV", "Production")
           TZ         = os.getenv("TZ", "Asia/Kolkata")
 
-          DT_URL   = (os.getenv("DT_URL") or "").rstrip("/")
-          DT_TOKEN = os.getenv("DT_TOKEN") or ""
           TEAMS_URL = os.getenv("TEAMS_WEBHOOK_URL") or ""
-
           SSH_USER = os.getenv("SSH_USER") or ""
           SSH_PORT = int(os.getenv("SSH_PORT") or "22")
 
           def post_teams(message, level="Info"):
               if not TEAMS_URL:
                   return
+              payload = {
+                  "@type": "MessageCard",
+                  "@context": "http://schema.org/extensions",
+                  "themeColor": "0076D7" if level.lower()=="info" else "FF0000",
+                  "summary": f"{level}: {message}",
+                  "sections": [{
+                      "activityTitle": f"**{level}**",
+                      "text": message
+                  }]
+              }
               try:
-                  payload = {
-                      "@type": "MessageCard",
-                      "@context": "http://schema.org/extensions",
-                      "themeColor": "0076D7" if level.lower()=="info" else "FF0000",
-                      "summary": f"{level}: {message}",
-                      "sections": [{
-                          "activityTitle": f"**{level}**",
-                          "text": message
-                      }]
-                  }
                   requests.post(TEAMS_URL, json=payload, timeout=10)
               except Exception as e:
                   print(f"Teams send failed: {e}")
 
           def parse_dt(s, tz):
               s = str(s or "").strip()
-              for f in (
-                  "%d-%m-%Y %H:%M:%S","%d-%m-%Y %H:%M",
-                  "%Y-%m-%d %H:%M:%S","%Y-%m-%d %H:%M",
-                  "%Y-%m-%dT%H:%M:%S",
-              ):
+              for f in ("%d-%m-%Y %H:%M:%S","%d-%m-%Y %H:%M","%Y-%m-%d %H:%M:%S","%Y-%m-%d %H:%M"):
                   try:
                       return tz.localize(datetime.strptime(s, f))
                   except Exception:
@@ -130,21 +123,23 @@ jobs:
                       stop  = parse_dt(row.get("stop date"), tz)
                       host = (row.get("host") or "").strip()
                       url  = (row.get("health url") or "").strip()
-                      stop_cmd = (row.get("stop command") or f"docker stop {app.lower()}").strip()
-                      start_cmd = (row.get("start command") or f"docker start {app.lower()}").strip()
+                      cmd  = (row.get("command") or "").strip()
+
+                      if not host or not cmd:
+                          continue
 
                       if start <= now <= stop:
-                          print(f"[{app}] inside patching window – stopping container")
-                          post_teams(f"⏳ Patching started for **{app}** – stopping Docker...", "Info")
+                          print(f"[{app}] inside patch window → stopping container")
+                          post_teams(f"🛑 Patching started for **{app}** – running `{cmd}`", "Info")
                           try:
-                              rc, out, err = ssh_run(host, stop_cmd)
+                              rc, out, err = ssh_run(host, cmd.replace("start", "stop"))
                               print(f"[{app}] stop exit={rc} out={out} err={err}")
                           except Exception as e:
                               post_teams(f"❌ Failed to stop {app}: {e}", "Alert")
                       else:
-                          print(f"[{app}] outside patching window – starting container and checking health")
+                          print(f"[{app}] outside patch window → starting container and checking health")
                           try:
-                              rc, out, err = ssh_run(host, start_cmd)
+                              rc, out, err = ssh_run(host, cmd)
                               print(f"[{app}] start exit={rc} out={out} err={err}")
                               post_teams(f"▶️ Restarted {app} after patching window", "Info")
                           except Exception as e:
@@ -153,7 +148,6 @@ jobs:
 
                           time.sleep(8)
                           code = http_status(url)
-                          print(f"[{app}] health status after restart: {code}")
                           if code == 200:
                               post_teams(f"✅ {app} is healthy after patching", "Info")
                           else:
