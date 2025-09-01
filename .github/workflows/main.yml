@@ -6,7 +6,7 @@ on:
 
   schedule:
 
-    - cron: "*/5 * * * *"   # every 5 minutes
+    - cron: "*/5 * * * *"
 
 jobs:
 
@@ -16,19 +16,15 @@ jobs:
 
     env:
 
-      CSV_PATH: "schedule.csv"
+      FILE_PATH: "schedule.csv"       # <— single source of truth (csv or xlsx)
 
       TARGET_ENV: "Production"
 
       TZ: "Asia/Kolkata"
 
-      # Dynatrace (add in GitHub → Settings → Secrets and variables → Actions)
-
       DT_URL: ${{ secrets.DT_ENV_URL }}
 
       DT_TOKEN: ${{ secrets.DT_TOKEN }}
-
-      # SSH to your EC2 (add these secrets)
 
       SSH_USER: ${{ secrets.SSH_USER }}
 
@@ -72,7 +68,7 @@ jobs:
 
           printf "Host *\n  StrictHostKeyChecking no\n" > ~/.ssh/config
 
-      - name: Create script
+      - name: Create script (auto-detect CSV/XLSX)
 
         run: |
 
@@ -84,21 +80,21 @@ jobs:
 
           import requests, paramiko, pytz
 
-          import pandas as pd  # not used directly here, but installed for future use
+          import pandas as pd
 
-          CSV_PATH  = os.getenv("CSV_PATH", "schedule.csv")
+          FILE_PATH  = os.getenv("FILE_PATH", "schedule.csv")
 
           TARGET_ENV = os.getenv("TARGET_ENV", "Production")
 
-          TZ        = os.getenv("TZ", "Asia/Kolkata")
+          TZ         = os.getenv("TZ", "Asia/Kolkata")
 
-          DT_URL    = (os.getenv("DT_URL") or "").rstrip("/")
+          DT_URL     = (os.getenv("DT_URL") or "").rstrip("/")
 
-          DT_TOKEN  = os.getenv("DT_TOKEN") or ""
+          DT_TOKEN   = os.getenv("DT_TOKEN") or ""
 
-          SSH_USER  = os.getenv("SSH_USER") or ""
+          SSH_USER   = os.getenv("SSH_USER") or ""
 
-          SSH_PORT  = int(os.getenv("SSH_PORT") or "22")
+          SSH_PORT   = int(os.getenv("SSH_PORT") or "22")
 
           def post_dt(event_type, title, desc, status="INFO"):
 
@@ -110,57 +106,25 @@ jobs:
 
                       f"{DT_URL}/api/v2/events/ingest",
 
-                      headers={
+                      headers={"Authorization": f"Api-Token {DT_TOKEN}","Content-type":"application/json"},
 
-                          "Authorization": f"Api-Token {DT_TOKEN}",
+                      json={"eventType":event_type,"title":title,"description":desc,"source":"GitHub Actions","status":status.lower()},
 
-                          "Content-type": "application/json",
-
-                      },
-
-                      json={
-
-                          "eventType": event_type,
-
-                          "title": title,
-
-                          "description": desc,
-
-                          "source": "GitHub Actions",
-
-                          "status": status.lower(),
-
-                      },
-
-                      timeout=10,
+                      timeout=10
 
                   )
 
-              except Exception:
-
-                  pass
+              except Exception: pass
 
           def parse_dt(s, tz):
 
               s = str(s or "").strip()
 
-              for f in (
+              for f in ("%d-%m-%Y %H:%M:%S","%d-%m-%Y %H:%M","%Y-%m-%d %H:%M:%S","%Y-%m-%d %H:%M","%Y-%m-%dT%H:%M:%S"):
 
-                  "%d-%m-%Y %H:%M:%S","%d-%m-%Y %H:%M",
+                  try: return tz.localize(datetime.strptime(s, f))
 
-                  "%Y-%m-%d %H:%M:%S","%Y-%m-%d %H:%M",
-
-                  "%Y-%m-%dT%H:%M:%S",
-
-              ):
-
-                  try:
-
-                      return tz.localize(datetime.strptime(s, f))
-
-                  except Exception:
-
-                      pass
+                  except Exception: pass
 
               raise ValueError(f"Bad date: {s}")
 
@@ -168,9 +132,7 @@ jobs:
 
               k = paramiko.RSAKey.from_private_key_file(os.path.expanduser("~/.ssh/id_rsa"))
 
-              c = paramiko.SSHClient()
-
-              c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+              c = paramiko.SSHClient(); c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
               c.connect(hostname=host, username=SSH_USER, port=SSH_PORT, pkey=k, timeout=15)
 
@@ -186,13 +148,37 @@ jobs:
 
           def http_status(url):
 
-              try:
+              try: return requests.get(url, timeout=8).status_code
 
-                  return requests.get(url, timeout=8).status_code
+              except Exception: return None
 
-              except Exception:
+          def load_rows(path):
 
-                  return None
+              ext = os.path.splitext(path)[1].lower()
+
+              if ext == ".csv":
+
+                  with open(path, newline='', encoding='utf-8') as f:
+
+                      for row in csv.DictReader(f):
+
+                          yield row
+
+              elif ext in (".xlsx",".xlsm",".xltx",".xltm"):
+
+                  # use pandas to read Excel; yields dicts
+
+                  df = pd.read_excel(path, engine="openpyxl")
+
+                  df = df.where(pd.notna(df), None)
+
+                  for row in df.to_dict(orient="records"):
+
+                      yield {k: (v if v is not None else "") for k, v in row.items()}
+
+              else:
+
+                  raise ValueError(f"Unsupported file type: {ext}")
 
           def main():
 
@@ -200,79 +186,77 @@ jobs:
 
               now = datetime.now(tz)
 
+              print(f"Using file: {FILE_PATH}")
+
               print(f"Now: {now} TZ={TZ}")
 
-              with open(CSV_PATH, newline='', encoding='utf-8') as f:
+              for raw in load_rows(FILE_PATH):
 
-                  reader = csv.DictReader(f)
+                  # case-insensitive header lookup
 
-                  for raw in reader:
+                  row = { (k or "").strip().lower(): v for k, v in raw.items() }
 
-                      # make lookups case-insensitive
+                  app = row.get("app name")
 
-                      row = { (k or "").strip().lower(): v for k, v in raw.items() }
+                  env = (row.get("environment") or "").strip()
 
-                      app = row.get("app name")
+                  if not app or env != TARGET_ENV:
 
-                      env = (row.get("environment") or "").strip()
+                      continue
 
-                      if not app or env != TARGET_ENV:
+                  start = parse_dt(row.get("start date"), tz)
 
-                          continue
+                  stop  = parse_dt(row.get("stop date"), tz)
 
-                      start = parse_dt(row.get("start date"), tz)
+                  if not (start <= now <= stop):
 
-                      stop  = parse_dt(row.get("stop date"), tz)
+                      print(f"[{app}] outside window ({start} to {stop}) – skip")
 
-                      if not (start <= now <= stop):
+                      continue
 
-                          print(f"[{app}] outside window ({start} to {stop}) – skip")
+                  host = (row.get("host") or "").strip()
 
-                          continue
+                  url  = (row.get("health url") or row.get("health_url") or "").strip()
 
-                      host = (row.get("host") or row.get("host ") or row.get("host name") or row.get("host")).strip() if row.get("host") is not None else (raw.get("HOST") or "").strip()
+                  rcmd = (row.get("command") or row.get("restart command") or "").strip()
 
-                      url  = (row.get("health url") or "").strip()
+                  code = http_status(url)
 
-                      rcmd = (row.get("command") or row.get("restart command") or "").strip()
+                  print(f"[{app}] health status: {code}")
 
-                      code = http_status(url)
+                  if code == 200:
 
-                      print(f"[{app}] health status: {code}")
+                      post_dt("CUSTOM_INFO", f"{app}: Health OK", f"{app} healthy")
 
-                      if code == 200:
+                      continue
 
-                          post_dt("CUSTOM_INFO", f"{app}: Health OK", f"{app} healthy")
+                  post_dt("CUSTOM_ALERT", f"{app}: Health Failed", f"Status {code}; restarting", status="FAILURE")
 
-                          continue
+                  try:
 
-                      post_dt("CUSTOM_ALERT", f"{app}: Health Failed", f"Status {code}; restarting", status="FAILURE")
+                      rc, out, err = ssh_run(host, rcmd)
 
-                      try:
+                      print(f"[{app}] restart exit={rc} out={out} err={err}")
 
-                          rc, out, err = ssh_run(host, rcmd)
+                  except Exception as e:
 
-                          print(f"[{app}] restart exit={rc} out={out} err={err}")
+                      print(f"[{app}] restart error: {e}")
 
-                      except Exception as e:
+                      continue
 
-                          print(f"[{app}] restart error: {e}")
+                  time.sleep(8)
 
-                          continue
+                  code2 = http_status(url)
 
-                      time.sleep(8)
+                  print(f"[{app}] health after restart: {code2}")
 
-                      code2 = http_status(url)
+                  if code2 == 200:
 
-                      print(f"[{app}] health after restart: {code2}")
+                      post_dt("CUSTOM_INFO", f"{app}: Recovered", f"{app} recovered")
 
-                      if code2 == 200:
+                  else:
 
-                          post_dt("CUSTOM_INFO", f"{app}: Recovered", f"{app} recovered")
-
-                      else:
-
-                          post_dt("CUSTOM_ALERT", f"{app}: Still Failing", f"Status {code2}", status="FAILURE")
+                      post_dt("CUSTOM_ALERT", f"{app}: Still Failing", f"Status {code2}", status="FAILURE")
 
           if __name__ == "__main__":
 
@@ -282,5 +266,11 @@ jobs:
 
       - name: Run windowed health check
 
-        run: python windowed_health_check.py
+        run: |
+
+          ls -l
+
+          python -V
+
+          python windowed_health_check.py
  
