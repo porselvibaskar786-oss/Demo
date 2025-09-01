@@ -42,7 +42,7 @@ jobs:
           - name: Write SSH key
         run: |
           mkdir -p ~/.ssh
-          echo "${SSH_KEY}" > ~/.ssh/id_rsa
+          echo "${EC2_KEY}" > ~/.ssh/id_rsa
           chmod 600 ~/.ssh/id_rsa
           ssh-keygen -y -f ~/.ssh/id_rsa > ~/.ssh/id_rsa.pub || true
           printf "Host *\n  StrictHostKeyChecking no\n" > ~/.ssh/config
@@ -60,8 +60,8 @@ jobs:
           TZ         = os.getenv("TZ", "Asia/Kolkata")
 
           TEAMS_URL = os.getenv("TEAMS_WEBHOOK_URL") or ""
-          SSH_USER = os.getenv("SSH_USER") or ""
-          SSH_PORT = int(os.getenv("SSH_PORT") or "22")
+          SSH_USER = os.getenv("EC2_USER") or ""
+          SSH_PORT = int(os.getenv("EC2_PORT") or "22")
 
           def post_teams(message, level="Info"):
               if not TEAMS_URL:
