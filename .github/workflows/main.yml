@@ -44,7 +44,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install boto3 requests pandas openpyxl pytz tabulate
 
-      - name: Run Patching Script with Mock Approval & Dynatrace Alerts
+      - name: Run Patching Script with Alias Mapping
         run: |
           cat > windowed_health_check_ssm.py <<'PY'
           import os, re, time, random
@@ -117,11 +117,19 @@ jobs:
               df.to_csv(CSV_PATH, index=False)
 
           def make_table(df):
-              df_disp = df[["app","instanceid","start","stop","url","owner","approval_status"]].fillna("-")
+              display_cols = []
+              for key in ["app","instanceid","start","stop","url","owner","approval_status"]:
+                  for alias in ALIASES.get(key, [key]):
+                      if alias in df.columns:
+                          display_cols.append(alias)
+                          break
+                  else:
+                      df[key] = "-"
+                      display_cols.append(key)
+              df_disp = df[display_cols].fillna("-")
               return tabulate(df_disp, headers="keys", tablefmt="github")
 
           def simulate_dynatrace_alerts():
-              # Random mock alerts for demo
               alerts = []
               severities = ["CRITICAL","WARNING","INFO"]
               for _ in range(random.randint(0,2)):
@@ -136,7 +144,7 @@ jobs:
               tz = pytz.timezone(TZ_NAME)
               now = datetime.now(tz)
               df = load_rows(CSV_PATH)
-              
+
               for idx, row in df.iterrows():
                   app = first_nonempty(row, ALIASES["app"])
                   env = first_nonempty(row, ALIASES["env"])
@@ -169,7 +177,7 @@ jobs:
                   # Post-approval patching
                   if approval == "approved" and start <= now <= stop:
                       post_teams("🛑 Patching started", f"{app} on {iid} (Owner: {owner})", table)
-                      time.sleep(2)  # simulate patching
+                      time.sleep(2)
                       post_teams("✅ Patching done", f"{app} health status: Healthy", table)
                       continue
 
