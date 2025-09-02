@@ -44,7 +44,7 @@ jobs:
       - name: Run patching workflow
         run: |
           python <<'PY'
-          import os, time, requests, pandas as pd, boto3, pytz
+          import os, time, requests, pandas as pd, boto3, pytz, random
           from datetime import datetime, timedelta
 
           # --- Environment ---
@@ -60,11 +60,11 @@ jobs:
 
           # --- Helpers ---
           def post_teams_table(df):
-              headers = "| App | Stage | Start | End | Pre-Check | Patch Start | App Restart | Status | Health Status |\n"
-              headers += "|-----|-------|-------|-----|----------|------------|-------------|--------|---------------|\n"
+              headers = "| App | Server ID | Stage | Start | End | Pre-Check | Patch Start | App Restart | Status | Health Status |\n"
+              headers += "|-----|-----------|-------|-------|-----|----------|------------|-------------|--------|---------------|\n"
               table_text = headers
               for _, row in df.iterrows():
-                  table_text += f"| {row['app_name']} | {row.get('stage','')} | {row['start_date']} | {row['stop_date']} | {row['pre_check']} | {row['patch_start']} | {row['app_restart']} | {row['status']} | {row['health_status']} |\n"
+                  table_text += f"| {row['app_name']} | {row['server_id']} | {row.get('stage','')} | {row['start_date']} | {row['stop_date']} | {row['pre_check']} | {row['patch_start']} | {row['app_restart']} | {row['status']} | {row['health_status']} |\n"
               payload = {
                   "@type":"MessageCard",
                   "@context":"http://schema.org/extensions",
@@ -130,6 +130,8 @@ jobs:
           df = pd.read_csv(CSV_PATH)
           df.columns = [c.strip().lower().replace(" ","_") for c in df.columns]
           now = datetime.now(TZ)
+
+          # Add necessary columns
           df['stage'] = "Pending"
           df['pre_check'] = "Pending"
           df['patch_start'] = "-"
@@ -138,6 +140,7 @@ jobs:
           df['health_status'] = "-"
           df['start_date'] = (now + timedelta(seconds=10)).strftime("%Y-%m-%d %H:%M:%S")
           df['stop_date'] = (now + timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")
+          df['server_id'] = [random.randint(1000,9999) for _ in range(len(df))]  # Random Server ID
 
           # Step 1: Patching calendar setup
           df['stage'] = "Calendar Setup"
