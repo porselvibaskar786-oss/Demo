@@ -134,22 +134,25 @@ jobs:
               app = row['app_name']
               post_teams(f"📌 Patching scheduled for {app} at {now.strftime('%H:%M:%S')}", "Info")
 
-          # --- Step 2: Update start/stop relative to current time ---
+          # --- Step 2: Auto-approve pending approvals and update start/stop ---
           for i, row in df.iterrows():
+              if row.get('approval_status','pending').lower() == "pending":
+                  df.at[i,'approval_status'] = "approved"
+                  post_teams(f"⚡ {row['app_name']} auto-approved for patching", "Info")
               df.at[i,'start_date'] = (now + timedelta(seconds=10)).strftime("%Y-%m-%d %H:%M:%S")
               df.at[i,'stop_date']  = (now + timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")
-              # Auto-approve any unapproved row
-              df.at[i,'approval_status'] = "approved"
-              post_teams(f"⚡ {row['app_name']} auto-approved for patching", "Info")
 
           df.to_csv(CSV_PATH,index=False)
 
-          # --- Step 3: Run patching ---
+          # --- Step 3: Run patching only if approved ---
           for idx,row in df.iterrows():
               try:
                   app = row['app_name']
                   env = row['environment']
                   if env != TARGET_ENV: continue
+                  if row.get('approval_status','pending').lower() != "approved":
+                      post_teams(f"⏳ {app} not approved, skipping", "Info")
+                      continue
 
                   start = pd.to_datetime(row['start_date'])
                   stop  = pd.to_datetime(row['stop_date'])
@@ -165,23 +168,28 @@ jobs:
                       continue
 
                   if start <= now <= stop:
-                      stop_cmd = cmd.replace("start","stop")
-                      post_teams(f"🛑 Patching window active for {app} on {iid}: `{stop_cmd}`","Info")
-                      rc, out, err = ssm_run(iid, stop_cmd)
-                      if rc != 0: post_teams(f"❌ Stop failed for {app} on {iid}: {err or out}","Alert")
+                      # Stop and restart the app
+                      restart_cmd = cmd.replace("start","stop") + " && " + cmd
+                      post_teams(f"▶️ Restarting {app} on {iid}: `{restart_cmd}`","Info")
+                      rc, out, err = ssm_run(iid, restart_cmd)
+                      if rc != 0: 
+                          post_teams(f"❌ Restart failed for {app} on {iid}: {err or out}","Alert")
+                          continue
                   else:
-                      post_teams(f"▶️ Starting {app} on {iid}: `{cmd}`","Info")
+                      post_teams(f"▶️ Executing {app} patching on {iid}: `{cmd}`","Info")
                       rc, out, err = ssm_run(iid, cmd)
                       if rc != 0: 
-                          post_teams(f"❌ Start failed for {app} on {iid}: {err or out}","Alert")
+                          post_teams(f"❌ Patching failed for {app} on {iid}: {err or out}","Alert")
                           continue
-                      time.sleep(8)
-                      status,_ = http_status_via_ssm(iid, url)
-                      if status == 200:
-                          post_teams(f"✅ {app} healthy after patching","Info")
-                          send_dynatrace_success(app)
-                      else:
-                          post_teams(f"❌ {app} NOT healthy after patching (status {status})","Alert")
+
+                  # --- Check health after patching ---
+                  time.sleep(8)
+                  status,_ = http_status_via_ssm(iid, url)
+                  if status == 200:
+                      post_teams(f"✅ {app} healthy after patching and restart", "Info")
+                      send_dynatrace_success(app)
+                  else:
+                      post_teams(f"❌ {app} NOT healthy after patching (status {status})","Alert")
 
               except Exception as e:
                   post_teams(f"❌ Unexpected error for row {idx}: {e}","Alert")
