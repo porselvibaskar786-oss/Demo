@@ -42,7 +42,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install boto3 requests pandas pytz
 
-      - name: Update CSV start/stop times and run patching
+      - name: Update CSV and send Teams messages
         run: |
           python <<'PY'
           import os, time, requests, pandas as pd, boto3, pytz
@@ -60,7 +60,7 @@ jobs:
           ssm = boto3.client("ssm", region_name=AWS_REGION)
 
           def post_teams(msg, level="Info"):
-              if not TEAMS_URL:
+              if not TEAMS_URL: 
                   print(msg)
                   return
               payload = {
@@ -122,25 +122,36 @@ jobs:
               except Exception as e:
                   print(f"[dynatrace] failed: {e}")
 
-          # --- Load CSV ---
+          # Load CSV
           df = pd.read_csv(CSV_PATH)
           df.columns = [c.strip().lower().replace(" ","_") for c in df.columns]
 
           now = datetime.now(TZ)
 
-          # --- Update start/stop relative to current time ---
+          # Step 1: Dummy message - patching scheduled
+          for idx,row in df.iterrows():
+              app = row['app_name']
+              post_teams(f"📌 Patching scheduled for {app} at {now.strftime('%H:%M:%S')}", "Info")
+
+          # Step 2: Update start/stop relative to current time
           for i, row in df.iterrows():
               df.at[i,'start_date'] = (now + timedelta(seconds=10)).strftime("%Y-%m-%d %H:%M:%S")
               df.at[i,'stop_date']  = (now + timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")
+              df.at[i,'approval_status'] = row.get('approval_status','pending')
 
           df.to_csv(CSV_PATH,index=False)
 
-          # --- Process each row ---
+          # Step 3: Run patching only if approved
           for idx,row in df.iterrows():
               try:
                   app = row['app_name']
                   env = row['environment']
                   if env != TARGET_ENV: continue
+                  approval = row.get('approval_status','pending').lower()
+                  if approval != "approved":
+                      post_teams(f"⏳ {app} pending approval", "Info")
+                      continue
+
                   start = pd.to_datetime(row['start_date'])
                   stop  = pd.to_datetime(row['stop_date'])
                   cmd = row['command']
@@ -172,5 +183,7 @@ jobs:
                           send_dynatrace_success(app)
                       else:
                           post_teams(f"❌ {app} NOT healthy after patching (status {status})","Alert")
+
               except Exception as e:
                   post_teams(f"❌ Unexpected error for row {idx}: {e}","Alert")
+          PY
