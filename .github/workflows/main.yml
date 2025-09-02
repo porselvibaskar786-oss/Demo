@@ -62,12 +62,12 @@ jobs:
 
           def post_teams_table(df, msg):
               table_text = "| App | Start | End | Pre-Check | Patch Start | App Restart | Status |
-"
+
               table_text += "|-----|-------|-----|-----------|-------------|-------------|--------|
-"
+
               for _, row in df.iterrows():
                   table_text += f"| {row['app_name']} | {row['start_date']} | {row['stop_date']} | {row['pre_check']} | {row['patch_start']} | {row['app_restart']} | {row['status']} |
-"
+
               payload = {
                   "@type":"MessageCard",
                   "@context":"http://schema.org/extensions",
