@@ -42,50 +42,44 @@ jobs:
           requests.post(TEAMS_URL, json={"text": text})
           PY
 
-      - name: Step 2: Reminder Before Patching
+      - name: Step 2: Reminder & Auto-Approval
         run: |
           python <<'PY'
           import pandas as pd, os, requests, pytz
           from datetime import datetime, timedelta
+
           TEAMS_URL = os.getenv("TEAMS_WEBHOOK_URL")
           CSV_PATH = os.getenv("CSV_PATH")
           TZ = pytz.timezone(os.getenv("TZ"))
           TARGET_ENV = os.getenv("TARGET_ENV")
+
           df = pd.read_csv(CSV_PATH, sep="\t")
           now = datetime.now(TZ)
 
-          for idx, row in df.iterrows():
-              if row['Environment'] != TARGET_ENV:
-                  continue
-              start = TZ.localize(datetime.strptime(row['start Date'], "%d-%m-%Y %H:%M:%S"))
+          def post(msg): requests.post(TEAMS_URL, json={"text": msg})
+
+          for idx,row in df.iterrows():
+              if row['Environment'] != TARGET_ENV: continue
+              start = TZ.localize(datetime.strptime(row['start Date'],"%d-%m-%Y %H:%M:%S"))
+
+              # Reminder 5 min before patching
               if start - timedelta(minutes=5) <= now < start:
-                  msg = f"⏰ Reminder: Patching starts in 5 minutes for {row['App Name']} (Owner: {row['Owner']})"
-                  requests.post(TEAMS_URL, json={"text": msg})
-          PY
+                  post(f"⏰ Reminder: Patching starts in 5 minutes for {row['App Name']} (Owner: {row['Owner']})")
 
-      - name: Step 2a: Auto-Approval
-        run: |
-          python <<'PY'
-          import pandas as pd, os, requests
-          TEAMS_URL = os.getenv("TEAMS_WEBHOOK_URL")
-          CSV_PATH = os.getenv("CSV_PATH")
-          df = pd.read_csv(CSV_PATH, sep="\t")
-          changed = False
-          for idx, row in df.iterrows():
-              if str(row.get("approval_status","")).lower() != "approved":
+              # Auto-Approval
+              approval = str(row.get("approval_status","")).lower()
+              if approval != "approved":
                   df.at[idx,"approval_status"] = "approved"
-                  requests.post(TEAMS_URL,json={"text":f"✅ Auto-approved: {row['App Name']} will start patching automatically."})
-                  changed = True
-          if changed:
-              df.to_csv(CSV_PATH, sep="\t", index=False)
+                  post(f"✅ Auto-approved: {row['App Name']} will start patching automatically.")
+
+          df.to_csv(CSV_PATH, sep="\t", index=False)
           PY
 
-      - name: Step 3: Patching + Health Check + Restart
+      - name: Step 3: Patching + Health Check + Auto-Restart
         run: |
           python <<'PY'
-          import pandas as pd, os, requests, time, pytz, boto3
+          import pandas as pd, os, requests, time, pytz, boto3, random
           from datetime import datetime
-          import random
 
           TEAMS_URL = os.getenv("TEAMS_WEBHOOK_URL")
           CSV_PATH = os.getenv("CSV_PATH")
@@ -93,78 +87,80 @@ jobs:
           TARGET_ENV = os.getenv("TARGET_ENV")
           EC2_INSTANCE_ID = os.getenv("EC2_INSTANCE_ID")
           AWS_REGION = os.getenv("AWS_REGION")
+
           ssm = boto3.client("ssm", region_name=AWS_REGION)
 
-          def post(msg):
-              requests.post(TEAMS_URL, json={"text": msg})
+          def post(msg): requests.post(TEAMS_URL,json={"text":msg})
 
           def restart(cmd):
-              if cmd and cmd != "-":
-                  ssm.send_command(
+              if cmd and cmd!="-":
+                  return ssm.send_command(
                       InstanceIds=[EC2_INSTANCE_ID],
                       DocumentName="AWS-RunShellScript",
-                      Parameters={"commands": [cmd]},
+                      Parameters={"commands":[cmd]},
                       TimeoutSeconds=60
                   )
 
           def health_check(url):
-              try:
-                  return requests.get(url, timeout=5).status_code == 200
-              except:
-                  return False
+              try: return requests.get(url, timeout=5).status_code==200
+              except: return False
+
+          def send_dynatrace_alert(app):
+              post(f"⚠ Dynatrace alert: {app} still unhealthy. Check Dynatrace console.")
 
           df = pd.read_csv(CSV_PATH, sep="\t")
           now = datetime.now(TZ)
 
-          for idx, row in df.iterrows():
-              if row['Environment'] != TARGET_ENV:
-                  continue
-
-              start = TZ.localize(datetime.strptime(row['start Date'], "%d-%m-%Y %H:%M:%S"))
-              stop  = TZ.localize(datetime.strptime(row['stop Date'], "%d-%m-%Y %H:%M:%S"))
-              approval = str(row.get("approval_status", "")).lower()
+          for idx,row in df.iterrows():
+              if row['Environment'] != TARGET_ENV: continue
+              app = row['App Name']
               url = row['health URL']
               cmd = row['Command']
-              app = row['App Name']
+              start = TZ.localize(datetime.strptime(row['start Date'],"%d-%m-%Y %H:%M:%S"))
+              stop  = TZ.localize(datetime.strptime(row['stop Date'],"%d-%m-%Y %H:%M:%S"))
+              approval = str(row.get("approval_status","")).lower()
 
-              # Inside patching window
-              if start <= now <= stop and approval == "approved":
-                  post(f"🛑 Patching started for {app} (Owner: {row['Owner']})")
+              # --- Inside patch window ---
+              if start <= now <= stop and approval=="approved":
+                  post(f"🛑 Patching started for {app}")
                   time.sleep(2)
                   if health_check(url):
-                      post(f"💚 Health check passed: {app} is healthy")
+                      post(f"💚 {app} is healthy")
                   else:
-                      post(f"❌ Health failed: {app}. Restarting via SSM...")
+                      post(f"❌ {app} unhealthy. Restarting...")
                       restart(cmd)
                       time.sleep(5)
                       if health_check(url):
-                          post(f"💚 App is healthy after restart: {app}")
+                          post(f"💚 {app} is healthy after restart")
                       else:
-                          post(f"⚠ Still unhealthy: {app} failed recovery")
+                          post(f"⚠ {app} still unhealthy")
+                          send_dynatrace_alert(app)
 
-              # Outside patching window
-              else:
-                  if health_check(url):
-                      post(f"💡 Health check: {app} is healthy")
+              # --- Outside patch window ---
+              elif now < start or now > stop:
+                  if not health_check(url):
+                      post(f"⚠ {app} unhealthy outside window — restarting...")
+                      restart(cmd)
+                      time.sleep(5)
+                      if health_check(url):
+                          post(f"💚 {app} healthy after restart outside window")
+                      else:
+                          post(f"⚠ {app} still unhealthy outside window")
+                          send_dynatrace_alert(app)
+                  else:
+                      # Optional: simulate restart for healthy apps
                       if random.choice([True, False]):
-                          post(f"🔄 Simulate stop & restart for {app}")
+                          post(f"🔄 Simulate restart for {app}")
                           restart(cmd)
                           time.sleep(5)
                           if health_check(url):
-                              post(f"💚 App is healthy after simulated restart: {app}")
+                              post(f"💚 {app} healthy after simulated restart")
                           else:
-                              post(f"⚠ Still unhealthy: {app} after simulated restart")
-                  else:
-                      post(f"⚠ Health check failed: {app} is unhealthy. Restarting...")
-                      restart(cmd)
-                      time.sleep(5)
-                      if health_check(url):
-                          post(f"💚 App is healthy after restart: {app}")
-                      else:
-                          post(f"⚠ Still unhealthy: {app} failed recovery")
+                              post(f"⚠ {app} still unhealthy after simulated restart")
+                              send_dynatrace_alert(app)
           PY
 
-      - name: Step 4: Dynatrace Alerts
+      - name: Step 4: Dynatrace Alerts Fetch
         run: |
           python <<'PY'
           import os, requests
@@ -172,18 +168,17 @@ jobs:
           DYNATRACE_ENV_ID = os.getenv("DYNATRACE_ENV_ID")
           DYNATRACE_API_TOKEN = os.getenv("DYNATRACE_API_TOKEN")
 
-          def post(msg):
-              requests.post(TEAMS_URL, json={"text": msg})
+          def post(msg): requests.post(TEAMS_URL,json={"text":msg})
 
           try:
-              url = f"https://{DYNATRACE_ENV_ID}.live.dynatrace.com/api/v2/problems"
-              headers = {"Authorization": f"Api-Token {DYNATRACE_API_TOKEN}", "Accept": "application/json"}
-              params = {"status": "OPEN", "from": "now-30m", "fields": "title,severity,affectedEntities"}
+              url=f"https://{DYNATRACE_ENV_ID}.live.dynatrace.com/api/v2/problems"
+              headers={"Authorization":f"Api-Token {DYNATRACE_API_TOKEN}","Accept":"application/json"}
+              params={"status":"OPEN","from":"now-30m","fields":"title,severity,affectedEntities"}
               r = requests.get(url, headers=headers, params=params, timeout=10)
               r.raise_for_status()
-              problems = r.json().get("problems", [])
+              problems = r.json().get("problems",[])
               for p in problems:
-                  entities = ", ".join([e['entityId'] for e in p.get("affectedEntities", [])])
+                  entities=", ".join([e['entityId'] for e in p.get("affectedEntities",[])])
                   post(f"⚠ Dynatrace Alert: {p['title']}\nSeverity: {p['severity']}\nAffected Entities: {entities}")
           except Exception as e:
               post(f"Dynatrace fetch failed: {e}")
