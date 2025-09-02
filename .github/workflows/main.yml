@@ -3,7 +3,7 @@ name: Patching Control (SSM) + Teams
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/5 * * * *"  # every 5 minutes
 
 jobs:
   patching-check:
@@ -40,44 +40,20 @@ jobs:
           python -m pip install --upgrade pip
           pip install boto3 requests pandas openpyxl pytz
 
-      - name: Run patching workflow with Auto-Approval
+      - name: Run patching workflow
         run: |
           python <<'PY'
-          import os, pandas as pd, requests, boto3, time, pytz, random
+          import os, re, time, pandas as pd, requests, boto3, pytz
           from datetime import datetime
 
-          CSV_PATH = os.getenv("CSV_PATH")
+          # ===== Env variables =====
+          CSV_PATH = os.getenv("CSV_PATH", "schedule.csv")
           TEAMS_URL = os.getenv("TEAMS_WEBHOOK_URL")
           TARGET_ENV = os.getenv("TARGET_ENV")
-          TZ = pytz.timezone(os.getenv("TZ"))
+          TZ = pytz.timezone(os.getenv("TZ", "Asia/Kolkata"))
           AWS_REGION = os.getenv("AWS_REGION")
           FALLBACK_IID = os.getenv("EC2_INSTANCE_ID")
           ssm = boto3.client("ssm", region_name=AWS_REGION)
-
-          # Header aliases
-          ALIASES = {
-              "app": ["app", "app_name", "appname", "application", "application_name"],
-              "env": ["environment", "env"],
-              "start": ["start", "start_date", "startdate", "window_start"],
-              "stop": ["stop", "stop_date", "stopdate", "window_stop", "end", "end_date"],
-              "cmd": ["command", "cmd", "restart_command", "action"],
-              "url": ["health_url", "health", "url", "healthcheck", "health_check_url"],
-              "iid": ["instanceid", "instance_id", "instance", "ec2_instance_id"],
-              "approval": ["approval_status", "approved", "approval"]
-          }
-
-          def first_nonempty(row: dict, names: list):
-              for n in names:
-                  v = row.get(n, "")
-                  if v is not None and str(v).strip() != "":
-                      return str(v).strip()
-              return ""
-
-          def require(row: dict, field: str):
-              v = first_nonempty(row, ALIASES[field])
-              if not v:
-                  raise ValueError(f"Missing required field: {field}")
-              return v
 
           def post_teams(msg, level="Info"):
               if not TEAMS_URL: return
@@ -89,9 +65,19 @@ jobs:
                   "sections": [{"activityTitle": f"**{level}**", "text": msg}],
               }
               try: requests.post(TEAMS_URL, json=payload, timeout=10)
-              except: print(f"[teams] failed to send: {msg}")
+              except: print(f"[teams] failed: {msg}")
 
-          def ssm_run(iid: str, cmd: str, timeout=180):
+          def normalize_cols(df):
+              df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+              return df
+
+          def parse_dt(s):
+              for fmt in ("%d-%m-%Y %H:%M:%S","%d-%m-%Y %H:%M","%Y-%m-%d %H:%M:%S"):
+                  try: return TZ.localize(datetime.strptime(s.strip(), fmt))
+                  except: continue
+              raise ValueError(f"Bad date: {s}")
+
+          def ssm_run(iid, cmd, timeout=180):
               try:
                   resp = ssm.send_command(
                       InstanceIds=[iid],
@@ -109,67 +95,53 @@ jobs:
               except Exception as e:
                   return 1, "", f"SSM error: {e}"
 
-          def http_status_via_ssm(iid: str, url: str):
-              if not url: return None, "no url"
-              cmd = f'curl -sS -m 8 -w "\\nHTTP_STATUS:%{{http_code}}" "{url}" || true'
-              code, out, err = ssm_run(iid, cmd)
-              if code != 0: return None, err or out
-              status = None
-              if "HTTP_STATUS:" in out:
-                  try: status = int(out.rsplit("HTTP_STATUS:",1)[1].strip())
-                  except: status = None
-              return status, out
-
           df = pd.read_csv(CSV_PATH)
-          df.columns = [c.strip() for c in df.columns]
+          df = normalize_cols(df)
 
-          # Step 1: Send schedule CSV to Teams
+          # Step 1: send schedule to Teams
           post_teams("📋 Patching Schedule:\n" + df.to_string(index=False))
 
           now = datetime.now(TZ)
-          print(f"Now={now}")
-
           any_action = False
-          for idx,row in df.iterrows():
+
+          for idx, row in df.iterrows():
               try:
-                  app = require(row, "app")
-                  env = require(row, "env")
+                  env = row.get("environment", "").strip()
                   if env != TARGET_ENV: continue
-                  iid = first_nonempty(row, ALIASES["iid"]) or FALLBACK_IID
-                  if not iid:
-                      post_teams(f"❌ {app}: No instance ID", "Alert")
-                      continue
 
-                  # Step 2: Auto-Approval
-                  approval = first_nonempty(row, ALIASES["approval"]).lower()
-                  if approval != "approved":
-                      df.at[idx, first_nonempty(row, ALIASES["approval"])] = "approved"
-                      post_teams(f"✅ Patching scheduled & auto-approved for {app}", "Info")
+                  app = row.get("app_name") or row.get("app")
+                  iid = row.get("instanceid") or FALLBACK_IID
+                  cmd = row.get("command") or row.get("cmd")
+                  url = row.get("health_url") or row.get("url")
+                  start = parse_dt(row.get("start_date") or row.get("start"))
+                  stop  = parse_dt(row.get("stop_date") or row.get("stop"))
 
-                  cmd = require(row, "cmd")
-                  url = first_nonempty(row, ALIASES["url"])
-                  start = datetime.strptime(require(row,"start"),"%d-%m-%Y %H:%M:%S")
-                  stop  = datetime.strptime(require(row,"stop"),"%d-%m-%Y %H:%M:%S")
+                  # Auto-approve
+                  if str(row.get("approval_status","")).lower() != "approved":
+                      df.at[idx,"approval_status"] = "approved"
+                      post_teams(f"✅ Patching scheduled & auto-approved for {app}")
 
-                  # Step 3: Run patching / health check
+                  any_action = True
+
+                  # Inside patch window → stop cmd
                   if start <= now <= stop:
                       stop_cmd = cmd.replace("start","stop")
                       post_teams(f"🛑 Patching active for {app} ({iid}) -> {stop_cmd}")
                       rc, out, err = ssm_run(iid, stop_cmd)
                       print(f"[{app}] stop rc={rc}\nstdout={out}\nstderr={err}")
                   else:
+                      # Outside window → start + health
                       post_teams(f"▶️ Starting {app} ({iid}) -> {cmd}")
                       rc, out, err = ssm_run(iid, cmd)
                       print(f"[{app}] start rc={rc}\nstdout={out}\nstderr={err}")
                       time.sleep(5)
                       if url:
-                          status, _ = http_status_via_ssm(iid, url)
-                          if status==200: post_teams(f"✅ {app} healthy", "Info")
-                          else: post_teams(f"❌ {app} unhealthy (status={status})", "Alert")
-                  any_action = True
+                          status, _ = ssm_run(iid, f'curl -sS -m 8 -w "\\nHTTP_STATUS:%{{http_code}}" "{url}"')
+                          if status==0: post_teams(f"✅ {app} healthy after patching")
+                          else: post_teams(f"❌ {app} unhealthy after patching", "Alert")
               except Exception as e:
-                  post_teams(f"❌ Error processing row: {e}", "Alert")
+                  post_teams(f"❌ Error processing row {idx}: {e}", "Alert")
 
-          # Save any changes (approval updates)
-          if any_action: df.to_csv(CSV_PATH, index=False)
+          # Save updated approvals
+          df.to_csv(CSV_PATH, index=False)
           PY
