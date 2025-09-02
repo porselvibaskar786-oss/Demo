@@ -20,147 +20,89 @@ jobs:
       DYNATRACE_API_TOKEN: ${{ secrets.DYNATRACE_API_TOKEN }}
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
-        run: pip install pandas requests pytz boto3
+      - run: pip install pandas requests pytz boto3
 
-      - name: Step 1: Send Schedule CSV
+      - name: Send Schedule + Reminder + Auto-Approval + Patching
         run: |
           python <<'PY'
-          import pandas as pd, os, requests
-          TEAMS_URL = os.getenv("TEAMS_WEBHOOK_URL")
-          CSV_PATH = os.getenv("CSV_PATH")
-          df = pd.read_csv(CSV_PATH, sep="\t")
-          text = "📋 Patching Schedule:\n" + df.to_string(index=False)
-          requests.post(TEAMS_URL, json={"text": text})
-          PY
-
-      - name: Step 2: Reminder & Auto-Approval
-        run: |
-          python <<'PY'
-          import pandas as pd, os, requests, pytz
+          import os, pandas as pd, requests, pytz, time, boto3
           from datetime import datetime, timedelta
 
           TEAMS_URL = os.getenv("TEAMS_WEBHOOK_URL")
           CSV_PATH = os.getenv("CSV_PATH")
-          TZ = pytz.timezone(os.getenv("TZ"))
           TARGET_ENV = os.getenv("TARGET_ENV")
-
-          df = pd.read_csv(CSV_PATH, sep="\t")
-          now = datetime.now(TZ)
-
-          def post(msg): requests.post(TEAMS_URL, json={"text": msg})
-
-          for idx,row in df.iterrows():
-              if row['Environment'] != TARGET_ENV: continue
-              start = TZ.localize(datetime.strptime(row['start Date'],"%d-%m-%Y %H:%M:%S"))
-
-              # Reminder 5 min before patching
-              if start - timedelta(minutes=5) <= now < start:
-                  post(f"⏰ Reminder: Patching starts in 5 minutes for {row['App Name']} (Owner: {row['Owner']})")
-
-              # Auto-Approval
-              approval = str(row.get("approval_status","")).lower()
-              if approval != "approved":
-                  df.at[idx,"approval_status"] = "approved"
-                  post(f"✅ Auto-approved: {row['App Name']} will start patching automatically.")
-
-          df.to_csv(CSV_PATH, sep="\t", index=False)
-          PY
-
-      - name: Step 3: Patching + Health Check + Auto-Restart
-        run: |
-          python <<'PY'
-          import pandas as pd, os, requests, time, pytz, boto3, random
-          from datetime import datetime
-
-          TEAMS_URL = os.getenv("TEAMS_WEBHOOK_URL")
-          CSV_PATH = os.getenv("CSV_PATH")
           TZ = pytz.timezone(os.getenv("TZ"))
-          TARGET_ENV = os.getenv("TARGET_ENV")
           EC2_INSTANCE_ID = os.getenv("EC2_INSTANCE_ID")
           AWS_REGION = os.getenv("AWS_REGION")
 
           ssm = boto3.client("ssm", region_name=AWS_REGION)
 
-          def post(msg): requests.post(TEAMS_URL,json={"text":msg})
-
+          def post(msg): requests.post(TEAMS_URL, json={"text": msg})
           def restart(cmd):
               if cmd and cmd!="-":
-                  return ssm.send_command(
+                  ssm.send_command(
                       InstanceIds=[EC2_INSTANCE_ID],
                       DocumentName="AWS-RunShellScript",
                       Parameters={"commands":[cmd]},
                       TimeoutSeconds=60
                   )
-
           def health_check(url):
               try: return requests.get(url, timeout=5).status_code==200
               except: return False
-
-          def send_dynatrace_alert(app):
-              post(f"⚠ Dynatrace alert: {app} still unhealthy. Check Dynatrace console.")
 
           df = pd.read_csv(CSV_PATH, sep="\t")
           now = datetime.now(TZ)
 
           for idx,row in df.iterrows():
               if row['Environment'] != TARGET_ENV: continue
-              app = row['App Name']
-              url = row['health URL']
-              cmd = row['Command']
-              start = TZ.localize(datetime.strptime(row['start Date'],"%d-%m-%Y %H:%M:%S"))
-              stop  = TZ.localize(datetime.strptime(row['stop Date'],"%d-%m-%Y %H:%M:%S"))
+              app, cmd, url = row['App Name'], row['Command'], row['health URL']
+              start = TZ.localize(datetime.strptime(row['start Date'], "%d-%m-%Y %H:%M:%S"))
+              stop  = TZ.localize(datetime.strptime(row['stop Date'], "%d-%m-%Y %H:%M:%S"))
               approval = str(row.get("approval_status","")).lower()
 
-              # --- Inside patch window ---
-              if start <= now <= stop and approval=="approved":
+              # Reminder 5 min before patching
+              if start - timedelta(minutes=5) <= now < start:
+                  post(f"⏰ Reminder: Patching starts in 5 min for {app} (Owner: {row['Owner']})")
+
+              # Auto-Approval
+              if approval != "approved":
+                  df.at[idx,"approval_status"] = "approved"
+                  post(f"✅ Auto-approved: {app} will start patching")
+
+              # Patching window
+              if start <= now <= stop and df.at[idx,"approval_status"]=="approved":
                   post(f"🛑 Patching started for {app}")
                   time.sleep(2)
-                  if health_check(url):
-                      post(f"💚 {app} is healthy")
-                  else:
+                  if not health_check(url):
                       post(f"❌ {app} unhealthy. Restarting...")
                       restart(cmd)
                       time.sleep(5)
-                      if health_check(url):
-                          post(f"💚 {app} is healthy after restart")
-                      else:
-                          post(f"⚠ {app} still unhealthy")
-                          send_dynatrace_alert(app)
+                  if health_check(url):
+                      post(f"💚 {app} is healthy")
+                  else:
+                      post(f"⚠ {app} still unhealthy")
 
-              # --- Outside patch window ---
-              elif now < start or now > stop:
+              # Outside patch window
+              else:
                   if not health_check(url):
-                      post(f"⚠ {app} unhealthy outside window — restarting...")
+                      post(f"⚠ {app} unhealthy outside window. Restarting...")
                       restart(cmd)
                       time.sleep(5)
                       if health_check(url):
-                          post(f"💚 {app} healthy after restart outside window")
+                          post(f"💚 {app} healthy after restart")
                       else:
-                          post(f"⚠ {app} still unhealthy outside window")
-                          send_dynatrace_alert(app)
-                  else:
-                      # Optional: simulate restart for healthy apps
-                      if random.choice([True, False]):
-                          post(f"🔄 Simulate restart for {app}")
-                          restart(cmd)
-                          time.sleep(5)
-                          if health_check(url):
-                              post(f"💚 {app} healthy after simulated restart")
-                          else:
-                              post(f"⚠ {app} still unhealthy after simulated restart")
-                              send_dynatrace_alert(app)
+                          post(f"⚠ {app} still unhealthy")
+
+          df.to_csv(CSV_PATH, sep="\t", index=False)
           PY
 
-      - name: Step 4: Dynatrace Alerts Fetch
+      - name: Dynatrace Alerts
         run: |
           python <<'PY'
           import os, requests
@@ -172,13 +114,12 @@ jobs:
 
           try:
               url=f"https://{DYNATRACE_ENV_ID}.live.dynatrace.com/api/v2/problems"
-              headers={"Authorization":f"Api-Token {DYNATRACE_API_TOKEN}","Accept":"application/json"}
+              headers={"Authorization":f"Api-Token {DYNATRACE_API_TOKEN}", "Accept":"application/json"}
               params={"status":"OPEN","from":"now-30m","fields":"title,severity,affectedEntities"}
               r = requests.get(url, headers=headers, params=params, timeout=10)
               r.raise_for_status()
-              problems = r.json().get("problems",[])
-              for p in problems:
-                  entities=", ".join([e['entityId'] for e in p.get("affectedEntities",[])])
+              for p in r.json().get("problems", []):
+                  entities = ", ".join([e['entityId'] for e in p.get("affectedEntities", [])])
                   post(f"⚠ Dynatrace Alert: {p['title']}\nSeverity: {p['severity']}\nAffected Entities: {entities}")
           except Exception as e:
               post(f"Dynatrace fetch failed: {e}")
