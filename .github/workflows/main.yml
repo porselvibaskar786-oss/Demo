@@ -47,7 +47,7 @@ jobs:
           import os, time, requests, pandas as pd, boto3, pytz
           from datetime import datetime, timedelta
 
-          # Env vars
+          # --- Environment ---
           CSV_PATH = os.getenv("CSV_PATH")
           TARGET_ENV = os.getenv("TARGET_ENV")
           TZ = pytz.timezone(os.getenv("TZ"))
@@ -56,16 +56,15 @@ jobs:
           EC2_INSTANCE_ID = os.getenv("EC2_INSTANCE_ID")
           DYNATRACE_ENV_ID = os.getenv("DYNATRACE_ENV_ID")
           DYNATRACE_API_TOKEN = os.getenv("DYNATRACE_API_TOKEN")
-
           ssm = boto3.client("ssm", region_name=AWS_REGION)
 
           # --- Helpers ---
           def post_teams_table(df):
-              headers = "| App | Start | End | Pre-Check | Patch Start | App Restart | Status | Health Status |\n"
-              headers += "|-----|-------|-----|----------|------------|-------------|--------|---------------|\n"
+              headers = "| App | Stage | Start | End | Pre-Check | Patch Start | App Restart | Status | Health Status |\n"
+              headers += "|-----|-------|-------|-----|----------|------------|-------------|--------|---------------|\n"
               table_text = headers
               for _, row in df.iterrows():
-                  table_text += f"| {row['app_name']} | {row['start_date']} | {row['stop_date']} | {row['pre_check']} | {row['patch_start']} | {row['app_restart']} | {row['status']} | {row['health_status']} |\n"
+                  table_text += f"| {row['app_name']} | {row.get('stage','')} | {row['start_date']} | {row['stop_date']} | {row['pre_check']} | {row['patch_start']} | {row['app_restart']} | {row['status']} | {row['health_status']} |\n"
               payload = {
                   "@type":"MessageCard",
                   "@context":"http://schema.org/extensions",
@@ -73,8 +72,10 @@ jobs:
                   "summary":"Patching Coordination",
                   "sections":[{"activityTitle":"**Patching Coordination**","text":table_text}],
               }
-              try: requests.post(TEAMS_URL,json=payload,timeout=10)
-              except Exception as e: print(f"[teams] table failed: {e}")
+              try:
+                  requests.post(TEAMS_URL,json=payload,timeout=10)
+              except Exception as e:
+                  print(f"[teams] table failed: {e}")
 
           def ssm_run(instance_id, cmd, timeout_s=180):
               try:
@@ -128,40 +129,42 @@ jobs:
           # --- Load CSV ---
           df = pd.read_csv(CSV_PATH)
           df.columns = [c.strip().lower().replace(" ","_") for c in df.columns]
-
           now = datetime.now(TZ)
+          df['stage'] = "Pending"
           df['pre_check'] = "Pending"
           df['patch_start'] = "-"
           df['app_restart'] = "-"
           df['status'] = "Pending"
           df['health_status'] = "-"
-
-          # Step1: Send initial patching calendar
           df['start_date'] = (now + timedelta(seconds=10)).strftime("%Y-%m-%d %H:%M:%S")
           df['stop_date'] = (now + timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")
+
+          # Step 1: Patching calendar setup
+          df['stage'] = "Calendar Setup"
           post_teams_table(df)
 
-          # Step2: Auto-approve and pre-check
+          # Step 2: Pre-check
           for idx,row in df.iterrows():
               df.at[idx,'pre_check'] = "Completed"
-
+              df.at[idx,'stage'] = "Pre-Check"
           post_teams_table(df)
 
-          # Step3: Patching workflow
+          # Step 3: Patching workflow
           for idx,row in df.iterrows():
               app = row['app_name']
               iid = row.get('instanceid') or EC2_INSTANCE_ID
               url = row.get('health_url')
               df.at[idx,'patch_start'] = "Started"
+              df.at[idx,'stage'] = "Patching"
 
               if not ensure_online(iid):
                   df.at[idx,'status'] = "Failed"
                   df.at[idx,'health_status'] = "Instance offline"
+                  df.at[idx,'stage'] = "Failed"
                   post_teams_table(df)
                   send_dynatrace(app,"SSM instance not online",success=False)
                   continue
 
-              # Stop & start app
               ssm_run(iid,"docker stop $(docker ps -q)")
               ssm_run(iid,"docker start $(docker ps -a -q)")
               time.sleep(8)
@@ -170,28 +173,32 @@ jobs:
               df.at[idx,'health_status'] = str(status or "No Response")
 
               if status != 200:
-                  # Retry
                   ssm_run(iid,"docker restart $(docker ps -a -q)")
                   time.sleep(8)
                   status = http_status_via_ssm(iid,url)
                   df.at[idx,'health_status'] = str(status or "No Response")
+
                   if status != 200:
                       df.at[idx,'status'] = "Failed"
                       df.at[idx,'app_restart'] = "Failed"
+                      df.at[idx,'stage'] = "Failed"
                       post_teams_table(df)
                       send_dynatrace(app,f"{app} failed health check",success=False)
                   else:
                       df.at[idx,'status'] = "Success after Retry"
                       df.at[idx,'app_restart'] = "Success"
+                      df.at[idx,'stage'] = "Patched after Retry"
                       post_teams_table(df)
                       send_dynatrace(app,f"{app} patched successfully after retry")
               else:
                   df.at[idx,'status'] = "Success"
                   df.at[idx,'app_restart'] = "Success"
+                  df.at[idx,'stage'] = "Patched"
                   post_teams_table(df)
                   send_dynatrace(app,f"{app} patched successfully")
 
-          # Final coordination table
+          # Step 4: Final coordination/status
+          df['stage'] = "Final Status"
           post_teams_table(df)
           df.to_csv(CSV_PATH,index=False)
           PY
