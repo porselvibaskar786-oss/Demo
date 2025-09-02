@@ -1,9 +1,9 @@
-name: Patching Control (SSM) + Teams
+name: Patching Control + Teams + Auto-Restart
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/5 * * * *"  # check every 5 mins for reminders & patching
 
 jobs:
   patching-check:
@@ -13,191 +13,149 @@ jobs:
       CSV_PATH: schedule.csv
       TARGET_ENV: Production
       TZ: Asia/Kolkata
-
-      AWS_REGION: ${{ secrets.AWS_REGION }}
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
-      EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
-
-      DYNATRACE_URL: ${{ secrets.DYNATRACE_URL }}
-      DYNATRACE_TOKEN: ${{ secrets.DYNATRACE_TOKEN }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install Python dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install boto3 requests pandas openpyxl pytz tabulate flask
+      - name: Install dependencies
+        run: pip install pandas requests pytz tabulate
 
-      - name: Run Patching Script with Teams Approval
+      - name: Patching + Reminders + Approval + Health Check
         run: |
-          cat > windowed_health_check_ssm.py <<'PY'
-          import os, re, time, random
+          python <<'PY'
+          import pandas as pd, os, time, requests, subprocess, re
           from datetime import datetime, timedelta
-          import pandas as pd
-          import requests, boto3, pytz
+          import pytz
           from tabulate import tabulate
 
           CSV_PATH = os.getenv("CSV_PATH", "schedule.csv")
           TARGET_ENV = os.getenv("TARGET_ENV", "Production")
-          TZ_NAME = os.getenv("TZ", "Asia/Kolkata")
-          AWS_REGION = os.getenv("AWS_REGION")
-          TEAMS_URL = os.getenv("TEAMS_WEBHOOK_URL") or ""
-          FALLBACK_IID = (os.getenv("EC2_INSTANCE_ID") or "").strip()
+          TZ = pytz.timezone(os.getenv("TZ", "Asia/Kolkata"))
+          TEAMS_URL = os.getenv("TEAMS_WEBHOOK_URL")
 
-          ssm = boto3.client("ssm", region_name=AWS_REGION)
-
-          ALIASES = {
-              "app": ["app", "app_name", "application"],
-              "env": ["environment", "env"],
-              "start": ["start", "start_date", "window_start"],
-              "stop": ["stop", "stop_date", "window_stop", "end"],
-              "url": ["health_url", "health", "url"],
-              "cmd": ["command", "cmd", "restart_command", "action"],
-              "instanceid": ["instanceid", "instance_id", "ec2_instance_id"],
-              "owner": ["owner"],
-              "approval": ["approval_status"]
+          COLS = {
+              "app":"app_name",
+              "env":"environment",
+              "start":"start_date",
+              "stop":"stop_date",
+              "url":"health_url",
+              "cmd":"command",
+              "iid":"instanceid",
+              "owner":"owner",
+              "approval":"approval_status"
           }
 
-          def first_nonempty(row, names):
-              for n in names:
-                  v = row.get(n, "")
-                  if v is not None and str(v).strip() != "":
-                      return str(v).strip()
-              return ""
+          def normalize(df):
+              df.columns = [re.sub(r"[^\w]+","_",c.strip().lower()) for c in df.columns]
+              for k,v in COLS.items():
+                  if v not in df.columns:
+                      df[v] = "-"
+              return df
+
+          def make_table(df):
+              return tabulate(df[list(COLS.values())], headers="keys", tablefmt="github")
 
           def post_teams(title, message, table=None, approve_url=None, color="0076D7"):
               if not TEAMS_URL: return
-              sections = [{"activityTitle": title, "text": message}]
-              if table: sections.append({"text": table})
+              sections=[{"activityTitle":title,"text":message}]
+              if table: sections.append({"text":table})
               if approve_url:
-                  sections.append({
-                      "potentialAction": [{
-                          "@type": "OpenUri",
-                          "name": "Approve",
-                          "targets": [{"os": "default", "uri": approve_url}]
-                      }]
-                  })
-              payload = {
-                  "@type": "MessageCard",
-                  "@context": "http://schema.org/extensions",
-                  "themeColor": color,
-                  "summary": title,
-                  "sections": sections,
-              }
-              try:
-                  requests.post(TEAMS_URL, json=payload, timeout=10)
-              except Exception as e:
-                  print(f"[teams] send failed: {e}")
+                  sections.append({"potentialAction":[{"@type":"OpenUri","name":"Approve","targets":[{"os":"default","uri":approve_url}]}]})
+              payload={"@type":"MessageCard","@context":"http://schema.org/extensions","themeColor":color,"summary":title,"sections":sections}
+              try: requests.post(TEAMS_URL,json=payload,timeout=10)
+              except Exception as e: print(f"[teams] send failed: {e}")
 
-          def parse_dt(s, tz):
-              s = (s or "").strip()
+          def save_df(df): df.to_csv(CSV_PATH,index=False)
+
+          def parse_dt(s):
               for fmt in ("%d-%m-%Y %H:%M:%S","%d-%m-%Y %H:%M","%Y-%m-%d %H:%M:%S","%Y-%m-%d %H:%M"):
-                  try: return tz.localize(datetime.strptime(s, fmt))
+                  try: return TZ.localize(datetime.strptime(s, fmt))
                   except: pass
               raise ValueError(f"Bad date '{s}'")
 
-          def load_rows(path):
-              ext = os.path.splitext(path)[1].lower()
-              if ext == ".csv": df = pd.read_csv(path)
-              elif ext in (".xlsx", ".xls"): df = pd.read_excel(path)
-              else: raise ValueError("Input must be CSV/XLSX")
-              df.columns = [re.sub(r"[^\w]+","_",c.strip().lower()) for c in df.columns]
-              if "approval_status" not in df.columns: df["approval_status"] = ""
-              return df
+          def health_check(url):
+              try: return requests.get(url, timeout=5).status_code==200
+              except: return False
 
-          def save_rows(df):
-              df.to_csv(CSV_PATH, index=False)
+          df = normalize(pd.read_csv(CSV_PATH))
+          now = datetime.now(TZ)
 
-          def make_table(df):
-              display_cols = []
-              for key in ["app","instanceid","start","stop","url","owner","approval_status"]:
-                  for alias in ALIASES.get(key, [key]):
-                      if alias in df.columns:
-                          display_cols.append(alias)
-                          break
+          for idx,row in df.iterrows():
+              app = row[COLS["app"]]
+              env = row[COLS["env"]]
+              start = parse_dt(row[COLS["start"]])
+              stop = parse_dt(row[COLS["stop"]])
+              url = row[COLS["url"]]
+              cmd = row[COLS["cmd"]]
+              owner = row[COLS["owner"]]
+              approval = row[COLS["approval"]].lower()
+
+              if env != TARGET_ENV: continue
+
+              table = make_table(df)
+
+              # 1-week reminder
+              if start - timedelta(days=7) <= now < start - timedelta(days=6, hours=23, minutes=55):
+                  post_teams("⏰ Reminder: Patching in 1 week",
+                             f"Patching for **{app}**. Owner: {owner}", table)
+                  continue
+
+              # 5-min reminder
+              if start - timedelta(minutes=5) <= now < start - timedelta(minutes=4, seconds=55):
+                  post_teams("⏰ Reminder: Patching starts in 5 minutes",
+                             f"Patching for **{app}**. Owner: {owner}", table)
+                  continue
+
+              # Approval request if not yet approved
+              if approval != "approved" and now < start:
+                  approve_link = f"https://your-server.com/approve?app={app}&idx={idx}"
+                  post_teams(f"📝 Approval required: {app}", f"Owner: {owner}, please approve patching.", table, approve_link)
+                  # wait up to 30 mins
+                  for _ in range(60):
+                      df = normalize(pd.read_csv(CSV_PATH))
+                      approval = df.at[idx,COLS["approval"]].lower()
+                      if approval=="approved": break
+                      time.sleep(30)
                   else:
-                      df[key] = "-"
-                      display_cols.append(key)
-              df_disp = df[display_cols].fillna("-")
-              return tabulate(df_disp, headers="keys", tablefmt="github")
-
-          def simulate_dynatrace_alerts():
-              alerts = []
-              severities = ["CRITICAL","WARNING","INFO"]
-              for _ in range(random.randint(0,2)):
-                  alerts.append({
-                      "title": f"Mock Alert {random.randint(1,99)}",
-                      "severityLevel": random.choice(severities),
-                      "status": random.choice(["OPEN","CLOSED"])
-                  })
-              return alerts
-
-          def main():
-              tz = pytz.timezone(TZ_NAME)
-              now = datetime.now(tz)
-              df = load_rows(CSV_PATH)
-
-              for idx, row in df.iterrows():
-                  app = first_nonempty(row, ALIASES["app"])
-                  env = first_nonempty(row, ALIASES["env"])
-                  if env != TARGET_ENV: continue
-                  start = parse_dt(first_nonempty(row, ALIASES["start"]), tz)
-                  stop = parse_dt(first_nonempty(row, ALIASES["stop"]), tz)
-                  iid = first_nonempty(row, ALIASES["instanceid"]) or FALLBACK_IID
-                  cmd = first_nonempty(row, ALIASES["cmd"])
-                  owner = first_nonempty(row, ALIASES["owner"])
-                  approval = first_nonempty(row, ALIASES["approval"]).lower()
-                  url = first_nonempty(row, ALIASES["url"])
-
-                  table = make_table(df)
-
-                  # 30-min approval request
-                  if start - timedelta(minutes=30) <= now < start - timedelta(minutes=29, seconds=55):
-                      approve_link = f"https://your-server.com/approve?app={app}&idx={idx}"
-                      post_teams(
-                          "📝 Approval required for patching",
-                          f"Patching for **{app}** (Owner: {owner}) is about to start. Please click Approve to continue.",
-                          table,
-                          approve_url=approve_link
-                      )
+                      post_teams(f"⚠ Skipped: {app}", f"No approval received.", table)
                       continue
 
-                  # Post-approval patching
-                  if approval == "approved" and start <= now <= stop:
-                      post_teams("🛑 Patching started", f"{app} on {iid} (Owner: {owner})", table)
-                      time.sleep(2)
-                      post_teams("✅ Patching done", f"{app} health status: Healthy", table)
-                      continue
+              # Start patching
+              if approval=="approved" and start <= now <= stop:
+                  post_teams(f"🛑 Patching started: {app}", f"Patching app {app} owned by {owner}", table)
+                  time.sleep(2)
+                  post_teams(f"✅ Patching done: {app}", f"{app} patching finished. Performing health check.", table)
 
-                  # Outside patching window: health check
-                  if now < start or now > stop:
-                      post_teams("💡 Health check", f"{app} status: Healthy", table)
+                  # Health check
+                  healthy = health_check(url)
+                  if healthy:
+                      post_teams(f"💚 Health check passed: {app}", f"{app} is healthy", table)
+                  else:
+                      post_teams(f"❌ Health check failed: {app}", f"{app} is unhealthy. Restarting...", table, color="FF0000")
+                      if cmd and cmd!="-":
+                          try:
+                              subprocess.run(cmd, shell=True, check=True)
+                              post_teams(f"🔄 App restarted: {app}", f"Restart command executed. Re-checking health.", table)
+                              time.sleep(5)
+                              if health_check(url):
+                                  post_teams(f"💚 Health restored: {app}", f"{app} is now healthy.", table)
+                              else:
+                                  post_teams(f"⚠ Still unhealthy: {app}", f"{app} failed to recover automatically.", table, color="FF0000")
+                          except Exception as e:
+                              post_teams(f"⚠ Restart failed: {app}", f"Error: {e}", table, color="FF0000")
 
-              # Mock Dynatrace alerts
-              alerts = simulate_dynatrace_alerts()
-              for a in alerts:
-                  post_teams(f"⚠ Dynatrace Alert: {a['title']}",
-                             f"Severity: {a['severityLevel']}\nStatus: {a['status']}",
-                             color="FF0000")
+              # Outside patching window: normal health check
+              if now < start or now > stop:
+                  healthy = health_check(url)
+                  if healthy:
+                      post_teams(f"💡 Health check: {app}", f"{app} is healthy", table)
+                  else:
+                      post_teams(f"⚠ Health check failed outside window: {app}", f"{app} unhealthy.", table, color="FF0000")
 
-          if __name__=="__main__":
-              main()
-          PY
-
-          python windowed_health_check_ssm.py
