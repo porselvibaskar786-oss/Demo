@@ -57,10 +57,9 @@ jobs:
           EC2_INSTANCE_ID = os.getenv("EC2_INSTANCE_ID")
           DYNATRACE_ENV_ID = os.getenv("DYNATRACE_ENV_ID")
           DYNATRACE_API_TOKEN = os.getenv("DYNATRACE_API_TOKEN")
-
           ssm = boto3.client("ssm", region_name=AWS_REGION)
 
-          # Helper functions
+          # Teams messaging
           def post_teams(msg, level="Info"):
               if not TEAMS_URL:
                   print(msg)
@@ -72,16 +71,18 @@ jobs:
                   "summary": f"{level}: {msg}",
                   "sections": [{"activityTitle": f"**{level}**", "text": msg}],
               }
-              try: requests.post(TEAMS_URL, json=payload, timeout=10)
-              except Exception as e: print(f"[teams] failed: {e}")
+              try:
+                  requests.post(TEAMS_URL, json=payload, timeout=10)
+              except Exception as e:
+                  print(f"[teams] failed: {e}")
 
           def post_teams_table(app, instance, start, end, health_url, msg="", level="Info"):
-              table_text = f"""
+              table_text = f"""\
 **{msg}**
 | App | Instance | Start | End | Health URL |
 |-----|---------|-------|-----|------------|
 | {app} | {instance} | {start} | {end} | {health_url} |
-              """
+"""
               payload = {
                   "@type": "MessageCard",
                   "@context": "http://schema.org/extensions",
@@ -89,8 +90,10 @@ jobs:
                   "summary": f"{level}: {msg}",
                   "sections": [{"activityTitle": f"**{level}**", "text": table_text}],
               }
-              try: requests.post(TEAMS_URL, json=payload, timeout=10)
-              except Exception as e: print(f"[teams] table failed: {e}")
+              try:
+                  requests.post(TEAMS_URL, json=payload, timeout=10)
+              except Exception as e:
+                  print(f"[teams] table failed: {e}")
 
           def send_patching_calendar(df):
               cal_text = "| App | Start | End |\n|-----|-------|-----|\n"
@@ -103,10 +106,12 @@ jobs:
                   "summary": "Patching Calendar",
                   "sections": [{"activityTitle": "**Patching Calendar**", "text": cal_text}],
               }
-              try: requests.post(TEAMS_URL, json=payload, timeout=10)
+              try:
+                  requests.post(TEAMS_URL, json=payload, timeout=10)
               except Exception as e:
                   print(f"[teams] calendar failed: {e}")
 
+          # SSM command
           def ssm_run(instance_id, cmd, timeout_s=180):
               try:
                   resp = ssm.send_command(
@@ -162,8 +167,12 @@ jobs:
               try:
                   url = f"https://{DYNATRACE_ENV_ID}.apps.dynatrace.com/api/v2/events"
                   headers = {"Authorization": f"Api-Token {DYNATRACE_API_TOKEN}"}
-                  payload = {"eventType":"CUSTOM_ALERT","attachRules":{"entityIds":[]},
-                             "source":"GitHub Actions","description":f"Patching FAILED for {app} - {msg}. Problem link: https://lyt09047.apps.dynatrace.com/ui/apps/dynatrace.davis.problems/"}
+                  payload = {
+                      "eventType":"CUSTOM_ALERT",
+                      "attachRules":{"entityIds":[]},
+                      "source":"GitHub Actions",
+                      "description": f"Patching FAILED for {app} - {msg}. Problem link: https://lyt09047.apps.dynatrace.com/ui/apps/dynatrace.davis.problems/"
+                  }
                   requests.post(url, headers=headers, json=payload, timeout=5)
               except Exception as e:
                   print(f"[dynatrace] failure alert failed: {e}")
@@ -173,7 +182,7 @@ jobs:
           df.columns = [c.strip().lower().replace(" ","_") for c in df.columns]
           now = datetime.now(TZ)
 
-          # Step 1: Auto-approve pending and set start/stop
+          # Auto-approve pending approvals and set start/stop times
           for i, row in df.iterrows():
               if row.get('approval_status','pending').lower() == 'pending':
                   df.at[i,'approval_status'] = 'approved'
@@ -184,7 +193,7 @@ jobs:
           # Send patching calendar
           send_patching_calendar(df)
 
-          # Step 2: Run patching workflow
+          # Run patching workflow
           for idx,row in df.iterrows():
               try:
                   app = row['app_name']
@@ -199,10 +208,10 @@ jobs:
                       continue
 
                   # Stop app
-                  rc, out, err = ssm_run(iid, "docker stop $(docker ps -q)")
+                  ssm_run(iid, "docker stop $(docker ps -q)")
 
                   # Start / patch
-                  rc, out, err = ssm_run(iid, "docker start $(docker ps -a -q)")
+                  ssm_run(iid, "docker start $(docker ps -a -q)")
 
                   # Health check
                   time.sleep(8)
@@ -211,7 +220,7 @@ jobs:
                   if status != 200:
                       send_dynatrace_failure(app, f"Health check failed")
                       # Retry restart once
-                      rc, out, err = ssm_run(iid, "docker restart $(docker ps -a -q)")
+                      ssm_run(iid, "docker restart $(docker ps -a -q)")
                       time.sleep(8)
                       status,_ = http_status_via_ssm(iid, url)
                       if status != 200:
