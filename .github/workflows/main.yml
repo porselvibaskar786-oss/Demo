@@ -1,9 +1,9 @@
-name: Patching Control + Teams + Auto-Restart
+name: Patching Control + Teams + Auto-Restart + Dynatrace
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/5 * * * *"  # checks every 5 minutes
+    - cron: "*/5 * * * *"
 
 jobs:
   patching-check:
@@ -16,6 +16,8 @@ jobs:
       TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
       AWS_REGION: ${{ secrets.AWS_REGION }}
       EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+      DYNATRACE_URL: ${{ secrets.DYNATRACE_URL }}
+      DYNATRACE_TOKEN: ${{ secrets.DYNATRACE_TOKEN }}
 
     steps:
       - name: Checkout
@@ -29,10 +31,10 @@ jobs:
       - name: Install dependencies
         run: pip install pandas requests pytz tabulate boto3
 
-      - name: Patching + Reminders + Auto-Approval + Health Check + Auto-Restart
+      - name: Patching + Auto-Approval + Health Check + Dynatrace Alerts
         run: |
           python <<'PY'
-          import pandas as pd, os, time, requests, re, boto3
+          import pandas as pd, os, time, requests, re, boto3, random
           from datetime import datetime, timedelta
           import pytz
           from tabulate import tabulate
@@ -43,6 +45,8 @@ jobs:
           TEAMS_URL = os.getenv("TEAMS_WEBHOOK_URL")
           AWS_REGION = os.getenv("AWS_REGION")
           EC2_INSTANCE_ID = os.getenv("EC2_INSTANCE_ID")
+          DYNATRACE_URL = os.getenv("DYNATRACE_URL")
+          DYNATRACE_TOKEN = os.getenv("DYNATRACE_TOKEN")
 
           ssm = boto3.client("ssm", region_name=AWS_REGION)
 
@@ -109,6 +113,18 @@ jobs:
               except Exception as e:
                   return str(e)
 
+          def get_dynatrace_alerts():
+              alerts = []
+              severities = ["CRITICAL","WARNING","INFO"]
+              for _ in range(random.randint(0,2)):
+                  alerts.append({
+                      "title": f"Mock Alert {random.randint(1,99)}",
+                      "severity": random.choice(severities),
+                      "status": random.choice(["OPEN","CLOSED"])
+                  })
+              return alerts
+
+          # ===== MAIN WORKFLOW =====
           df = normalize(pd.read_csv(CSV_PATH))
           now = datetime.now(TZ)
 
@@ -123,7 +139,6 @@ jobs:
               approval = row[COLS["approval"]].lower()
 
               if env != TARGET_ENV: continue
-
               table = make_table(df)
 
               # 1-week reminder
@@ -151,7 +166,6 @@ jobs:
                   time.sleep(2)
                   post_teams(f"✅ Patching done: {app}", f"{app} patching finished. Performing health check.", table)
 
-                  # Health check
                   healthy = health_check(url)
                   if healthy:
                       post_teams(f"💚 Health check passed: {app}", f"{app} is healthy", table)
@@ -166,9 +180,19 @@ jobs:
                           else:
                               post_teams(f"⚠ Still unhealthy: {app}", f"{app} failed to recover automatically.", table, color="FF0000")
 
-              # Outside patching window: normal health check
+              # Outside patching window
               if now < start or now > stop:
                   healthy = health_check(url)
                   if healthy:
                       post_teams(f"💡 Health check: {app}", f"{app} is healthy", table)
                   else:
+                      post_teams(f"⚠ Health check failed outside window: {app}", f"{app} is unhealthy.", table, color="FF0000")
+
+          # ===== Dynatrace Alerts =====
+          alerts = get_dynatrace_alerts()
+          for a in alerts:
+              color_map = {"CRITICAL":"FF0000","WARNING":"FFA500","INFO":"0076D7"}
+              post_teams(f"⚠ Dynatrace Alert: {a['title']}",
+                         f"Severity: {a['severity']}\nStatus: {a['status']}",
+                         color=color_map.get(a['severity'], "0076D7"))
+          PY
