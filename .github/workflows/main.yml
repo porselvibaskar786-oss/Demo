@@ -1,4 +1,4 @@
-name: Patching Control (SSM) + Teams + Dynatrace
+name: Patching Control (SSM) + Teams + Dynatrace (Teams Approval)
 
 on:
   workflow_dispatch:
@@ -42,7 +42,37 @@ jobs:
           python -m pip install --upgrade pip
           pip install boto3 requests pandas pytz
 
-      - name: Update CSV and send Teams messages
+      # Step 1 & 2: Send Teams approval card and wait
+      - name: Send Teams approval card and simulate wait
+        run: |
+          python <<'PY'
+          import os, json, requests, time
+
+          TEAMS_URL = os.getenv("TEAMS_WEBHOOK_URL")
+          if TEAMS_URL:
+              card_payload = {
+                  "@type": "MessageCard",
+                  "@context": "http://schema.org/extensions",
+                  "themeColor": "0076D7",
+                  "summary": "Patching Scheduled - Approval Required",
+                  "sections": [
+                      {"activityTitle": "**Patching Scheduled**",
+                       "text": "Patching is scheduled. Please approve to execute."}
+                  ],
+                  "potentialAction": [
+                      {"@type": "HttpPOST","name": "Approve","target": TEAMS_URL,"body": json.dumps({"approval": "approve"})},
+                      {"@type": "HttpPOST","name": "Reject","target": TEAMS_URL,"body": json.dumps({"approval": "reject"})}
+                  ]
+              }
+              try: requests.post(TEAMS_URL, json=card_payload, timeout=10)
+              except Exception as e: print(f"[teams] failed to send approval card: {e}")
+
+          print("⏳ Waiting for Teams approval simulation (60s)...")
+          time.sleep(60)
+PY
+
+      # Step 3: Update CSV, send dummy message, and run SSM patching
+      - name: Update CSV, send Teams messages, and execute patching
         run: |
           python <<'PY'
           import os, time, requests, pandas as pd, boto3, pytz
@@ -60,27 +90,20 @@ jobs:
           ssm = boto3.client("ssm", region_name=AWS_REGION)
 
           def post_teams(msg, level="Info"):
-              if not TEAMS_URL: 
-                  print(msg)
-                  return
-              payload = {
-                  "@type": "MessageCard",
-                  "@context": "http://schema.org/extensions",
-                  "themeColor": "0076D7" if level.lower()=="info" else "FF0000",
-                  "summary": f"{level}: {msg}",
-                  "sections": [{"activityTitle": f"**{level}**", "text": msg}],
-              }
+              if not TEAMS_URL: print(msg); return
+              payload = {"@type":"MessageCard","@context":"http://schema.org/extensions",
+                         "themeColor":"0076D7" if level.lower()=="info" else "FF0000",
+                         "summary":f"{level}: {msg}",
+                         "sections":[{"activityTitle":f"**{level}**","text":msg}]}
               try: requests.post(TEAMS_URL, json=payload, timeout=10)
               except Exception as e: print(f"[teams] failed: {e}")
 
           def ssm_run(instance_id, cmd, timeout_s=180):
               try:
-                  resp = ssm.send_command(
-                      InstanceIds=[instance_id],
-                      DocumentName="AWS-RunShellScript",
-                      Parameters={"commands":[cmd]},
-                      CloudWatchOutputConfig={"CloudWatchOutputEnabled": False},
-                  )
+                  resp = ssm.send_command(InstanceIds=[instance_id],
+                                          DocumentName="AWS-RunShellScript",
+                                          Parameters={"commands":[cmd]},
+                                          CloudWatchOutputConfig={"CloudWatchOutputEnabled": False})
                   cmd_id = resp["Command"]["CommandId"]
                   for _ in range(timeout_s):
                       out = ssm.get_command_invocation(CommandId=cmd_id, InstanceId=instance_id)
@@ -89,8 +112,7 @@ jobs:
                           return code, out.get("StandardOutputContent",""), out.get("StandardErrorContent","")
                       time.sleep(1)
                   return 1,"","Timed out waiting for SSM command"
-              except Exception as e:
-                  return 1,"",f"SSM error: {e}"
+              except Exception as e: return 1,"",f"SSM error: {e}"
 
           def http_status_via_ssm(instance_id, url):
               if not url: return None,"no url"
@@ -119,8 +141,7 @@ jobs:
                   payload = {"eventType":"CUSTOM_ANNOTATION","attachRules":{"entityIds":[]},
                              "source":"GitHub Actions","description":f"Patching successful: {app}"}
                   requests.post(url, headers=headers, json=payload, timeout=5)
-              except Exception as e:
-                  print(f"[dynatrace] failed: {e}")
+              except Exception as e: print(f"[dynatrace] failed: {e}")
 
           # Load CSV
           df = pd.read_csv(CSV_PATH)
@@ -128,20 +149,20 @@ jobs:
 
           now = datetime.now(TZ)
 
-          # Step 1: Dummy message - patching scheduled
+          # Dummy message: patching scheduled
           for idx,row in df.iterrows():
               app = row['app_name']
               post_teams(f"📌 Patching scheduled for {app} at {now.strftime('%H:%M:%S')}", "Info")
 
-          # Step 2: Update start/stop relative to current time
+          # Update start/stop relative to current time
           for i, row in df.iterrows():
               df.at[i,'start_date'] = (now + timedelta(seconds=10)).strftime("%Y-%m-%d %H:%M:%S")
               df.at[i,'stop_date']  = (now + timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")
-              df.at[i,'approval_status'] = row.get('approval_status','pending')
+              df.at[i,'approval_status'] = row.get('approval_status','approved')  # simulate approved
 
           df.to_csv(CSV_PATH,index=False)
 
-          # Step 3: Run patching only if approved
+          # Run patching only if approved
           for idx,row in df.iterrows():
               try:
                   app = row['app_name']
@@ -173,7 +194,7 @@ jobs:
                   else:
                       post_teams(f"▶️ Starting {app} on {iid}: `{cmd}`","Info")
                       rc, out, err = ssm_run(iid, cmd)
-                      if rc != 0: 
+                      if rc != 0:
                           post_teams(f"❌ Start failed for {app} on {iid}: {err or out}","Alert")
                           continue
                       time.sleep(8)
@@ -183,7 +204,6 @@ jobs:
                           send_dynatrace_success(app)
                       else:
                           post_teams(f"❌ {app} NOT healthy after patching (status {status})","Alert")
-
               except Exception as e:
                   post_teams(f"❌ Unexpected error for row {idx}: {e}","Alert")
-          PY
+PY
