@@ -93,7 +93,7 @@ jobs:
 
           df.to_csv(CSV_PATH, index=False)
 
-          # --- Step 3: Patching and Health Check ---
+          # --- Step 3 & 4: Patching and Health Check with Self-Healing ---
           for idx,row in df.iterrows():
               if row['Environment'] != TARGET_ENV: continue
               start = TZ.localize(datetime.strptime(row['start Date'],"%d-%m-%Y %H:%M:%S"))
@@ -121,6 +121,30 @@ jobs:
               # Outside window: normal health check + self-healing
               elif now < start or now > stop:
                   attempt = 1
-                  while True:
+                  max_attempts = 5
+                  while attempt <= max_attempts:
                       if health_check(url):
-                          post(f"💡 Health check: {app} is
+                          post(f"💡 Health check: {app} is healthy (Attempt {attempt})")
+                          break
+                      else:
+                          post(f"⚠ Health check failed outside window: {app} is unhealthy (Attempt {attempt})")
+                          restart(cmd)
+                          time.sleep(5)
+                          attempt += 1
+                  else:
+                      post(f"⚠ Still unhealthy after {max_attempts} restarts: {app}")
+
+          # --- Step 5: Dynatrace Alerts ---
+          try:
+              url=f"https://{DYNATRACE_ENV_ID}.live.dynatrace.com/api/v2/problems"
+              headers={"Authorization":f"Api-Token {DYNATRACE_API_TOKEN}","Accept":"application/json"}
+              params={"status":"OPEN","from":"now-30m","fields":"title,severity,affectedEntities"}
+              r = requests.get(url, headers=headers, params=params, timeout=10)
+              r.raise_for_status()
+              problems = r.json().get("problems",[])
+              for p in problems:
+                  entities=", ".join([e['entityId'] for e in p.get("affectedEntities",[])])
+                  post(f"⚠ Dynatrace Alert: {p['title']}\nSeverity: {p['severity']}\nAffected Entities: {entities}")
+          except Exception as e:
+              post(f"Dynatrace fetch failed: {e}")
+          PY
