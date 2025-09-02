@@ -1,13 +1,14 @@
-name: Patching Coordination Workflow
+name: Patching Control (SSM) + Teams + Dynatrace
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/15 * * * *"  # every 15 minutes
+    - cron: "*/15 * * * *"
 
 jobs:
   patching-check:
     runs-on: ubuntu-latest
+
     env:
       CSV_PATH: schedule.csv
       TARGET_ENV: Production
@@ -21,8 +22,7 @@ jobs:
       DYNATRACE_API_TOKEN: ${{ secrets.DYNATRACE_API_TOKEN }}
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -34,51 +34,47 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install boto3 requests pandas pytz
 
-      - name: Run patching coordination script
+      - name: Run patching workflow
         run: |
           python <<'PY'
-          # Python script content goes here
           import os, time, requests, pandas as pd, boto3, pytz
           from datetime import datetime, timedelta
 
-          # Load environment variables
-          CSV_PATH = os.getenv("CSV_PATH", "schedule.csv")
-          TARGET_ENV = os.getenv("TARGET_ENV", "Production")
-          TZ = pytz.timezone(os.getenv("TZ", "Asia/Kolkata"))
+          # Env vars
+          CSV_PATH = os.getenv("CSV_PATH")
+          TARGET_ENV = os.getenv("TARGET_ENV")
+          TZ = pytz.timezone(os.getenv("TZ"))
           TEAMS_URL = os.getenv("TEAMS_WEBHOOK_URL")
-          AWS_REGION = os.getenv("AWS_REGION", "ap-south-1")
+          AWS_REGION = os.getenv("AWS_REGION")
           EC2_INSTANCE_ID = os.getenv("EC2_INSTANCE_ID")
           DYNATRACE_ENV_ID = os.getenv("DYNATRACE_ENV_ID")
           DYNATRACE_API_TOKEN = os.getenv("DYNATRACE_API_TOKEN")
 
           ssm = boto3.client("ssm", region_name=AWS_REGION)
 
-          def post_teams_table(df, msg):
-              table_text = "| App | Start | End | Pre-Check | Patch Start | App Restart | Status |
-
-              table_text += "|-----|-------|-----|-----------|-------------|-------------|--------|
-
+          # --- Helpers ---
+          def post_teams_table(df):
+              headers = "| App | Start | End | Pre-Check | Patch Start | App Restart | Status | Health Status |\n"
+              headers += "|-----|-------|-----|----------|------------|-------------|--------|---------------|\n"
+              table_text = headers
               for _, row in df.iterrows():
-                  table_text += f"| {row['app_name']} | {row['start_date']} | {row['stop_date']} | {row['pre_check']} | {row['patch_start']} | {row['app_restart']} | {row['status']} |
-
+                  table_text += f"| {row['app_name']} | {row['start_date']} | {row['stop_date']} | {row['pre_check']} | {row['patch_start']} | {row['app_restart']} | {row['status']} | {row['health_status']} |\n"
               payload = {
                   "@type":"MessageCard",
                   "@context":"http://schema.org/extensions",
                   "themeColor":"0076D7",
-                  "summary": msg,
-                  "sections":[{"activityTitle":f"**{msg}**","text":table_text}],
+                  "summary":"Patching Coordination",
+                  "sections":[{"activityTitle":"**Patching Coordination**","text":table_text}],
               }
-              try:
-                  requests.post(TEAMS_URL, json=payload, timeout=10)
-              except Exception as e:
-                  print(f"[teams] failed: {e}")
+              try: requests.post(TEAMS_URL,json=payload,timeout=10)
+              except Exception as e: print(f"[teams] table failed: {e}")
 
           def ssm_run(instance_id, cmd, timeout_s=180):
               try:
@@ -94,16 +90,17 @@ jobs:
                       if out["Status"] in ("Success","Failed","Cancelled","TimedOut"):
                           return int(out.get("ResponseCode",1)), out.get("StandardOutputContent",""), out.get("StandardErrorContent","")
                       time.sleep(1)
-                  return 1,"","Timed out waiting for SSM command"
+                  return 1,"","Timed out"
               except Exception as e:
                   return 1,"",f"SSM error: {e}"
 
           def http_status_via_ssm(instance_id, url):
               if not url: return None
-              shell = f'curl -sS -m 8 -w "\nHTTP_STATUS:%{{http_code}}" "{url}" || true'
+              shell = f'curl -sS -m 8 -w "\\nHTTP_STATUS:%{{http_code}}" "{url}" || true'
               code, out, err = ssm_run(instance_id, shell)
               if code != 0: return None
-              try: return int(out.rsplit("HTTP_STATUS:",1)[1].strip())
+              try:
+                  return int(out.rsplit("HTTP_STATUS:",1)[1].strip())
               except: return None
 
           def ensure_online(instance_id):
@@ -114,79 +111,87 @@ jobs:
               except: pass
               return False
 
-          def send_dynatrace_event(app, msg, success=True):
+          def send_dynatrace(app,msg,success=True):
               if not DYNATRACE_ENV_ID or not DYNATRACE_API_TOKEN: return
               try:
                   url = f"https://{DYNATRACE_ENV_ID}.apps.dynatrace.com/api/v2/events"
                   headers = {"Authorization": f"Api-Token {DYNATRACE_API_TOKEN}"}
                   payload = {
-                      "eventType":"CUSTOM_ANNOTATION" if success else "CUSTOM_ALERT",
+                      "eventType": "CUSTOM_ANNOTATION" if success else "CUSTOM_ALERT",
                       "attachRules":{"entityIds":[]},
                       "source":"GitHub Actions",
-                      "description": f"{app} - {msg}."
+                      "description":msg + (" ✅" if success else f" ❌ Problem link: https://lyt09047.apps.dynatrace.com/ui/apps/dynatrace.davis.problems/")
                   }
                   requests.post(url, headers=headers, json=payload, timeout=5)
-              except Exception as e:
-                  print(f"[dynatrace] event failed: {e}")
+              except Exception as e: print(f"[dynatrace] alert failed: {e}")
 
-          try:
-              df = pd.read_csv(CSV_PATH)
-              df.columns = [c.strip().lower().replace(" ","_") for c in df.columns]
-              now = datetime.now(TZ)
+          # --- Load CSV ---
+          df = pd.read_csv(CSV_PATH)
+          df.columns = [c.strip().lower().replace(" ","_") for c in df.columns]
 
-              post_teams_table(df, msg="Patching Calendar - Planned")
+          now = datetime.now(TZ)
+          df['pre_check'] = "Pending"
+          df['patch_start'] = "-"
+          df['app_restart'] = "-"
+          df['status'] = "Pending"
+          df['health_status'] = "-"
 
-              for i, row in df.iterrows():
-                  df.at[i,'start_date'] = (now + timedelta(seconds=10)).strftime("%Y-%m-%d %H:%M:%S")
-                  df.at[i,'stop_date']  = (now + timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")
-                  df.at[i,'pre_check'] = "Completed"
-                  df.at[i,'patch_start'] = "Scheduled"
-                  df.at[i,'app_restart'] = "-"
-                  df.at[i,'status'] = "-"
-              df.to_csv(CSV_PATH,index=False)
-              post_teams_table(df, msg="Pre-Patching Calendar")
+          # Step1: Send initial patching calendar
+          df['start_date'] = (now + timedelta(seconds=10)).strftime("%Y-%m-%d %H:%M:%S")
+          df['stop_date'] = (now + timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")
+          post_teams_table(df)
 
-              for idx, row in df.iterrows():
-                  app = row['app_name']
-                  env = row['environment']
-                  if env != TARGET_ENV: continue
-                  iid = row.get('instanceid') or EC2_INSTANCE_ID
-                  url = row.get('health_url')
+          # Step2: Auto-approve and pre-check
+          for idx,row in df.iterrows():
+              df.at[idx,'pre_check'] = "Completed"
 
-                  df.at[idx,'patch_start'] = "Started"
-                  post_teams_table(df, msg=f"Patching started for {app}")
+          post_teams_table(df)
 
-                  if not ensure_online(iid):
-                      df.at[idx,'status'] = "Failed"
-                      post_teams_table(df, msg=f"{app} - Instance not online")
-                      send_dynatrace_event(app, "SSM instance not online", success=False)
-                      continue
+          # Step3: Patching workflow
+          for idx,row in df.iterrows():
+              app = row['app_name']
+              iid = row.get('instanceid') or EC2_INSTANCE_ID
+              url = row.get('health_url')
+              df.at[idx,'patch_start'] = "Started"
 
-                  ssm_run(iid, row.get('command',''))
-                  df.at[idx,'app_restart'] = "Completed"
-                  post_teams_table(df, msg=f"{app} - App restarted")
+              if not ensure_online(iid):
+                  df.at[idx,'status'] = "Failed"
+                  df.at[idx,'health_status'] = "Instance offline"
+                  post_teams_table(df)
+                  send_dynatrace(app,"SSM instance not online",success=False)
+                  continue
 
+              # Stop & start app
+              ssm_run(iid,"docker stop $(docker ps -q)")
+              ssm_run(iid,"docker start $(docker ps -a -q)")
+              time.sleep(8)
+
+              status = http_status_via_ssm(iid,url)
+              df.at[idx,'health_status'] = str(status or "No Response")
+
+              if status != 200:
+                  # Retry
+                  ssm_run(iid,"docker restart $(docker ps -a -q)")
                   time.sleep(8)
-                  status = http_status_via_ssm(iid, url)
+                  status = http_status_via_ssm(iid,url)
+                  df.at[idx,'health_status'] = str(status or "No Response")
                   if status != 200:
-                      ssm_run(iid, "docker restart $(docker ps -a -q)")
-                      time.sleep(8)
-                      status = http_status_via_ssm(iid, url)
-                      if status != 200:
-                          df.at[idx,'status'] = "Failed"
-                          post_teams_table(df, msg=f"{app} - Health check failed after retry")
-                          send_dynatrace_event(app, "Health check failed after retry", success=False)
-                      else:
-                          df.at[idx,'status'] = "Success after Retry"
-                          post_teams_table(df, msg=f"{app} - App healthy after retry")
-                          send_dynatrace_event(app, "Patching successful after retry")
+                      df.at[idx,'status'] = "Failed"
+                      df.at[idx,'app_restart'] = "Failed"
+                      post_teams_table(df)
+                      send_dynatrace(app,f"{app} failed health check",success=False)
                   else:
-                      df.at[idx,'status'] = "Success"
-                      post_teams_table(df, msg=f"{app} - Patching done — App healthy")
-                      send_dynatrace_event(app, "Patching successful")
+                      df.at[idx,'status'] = "Success after Retry"
+                      df.at[idx,'app_restart'] = "Success"
+                      post_teams_table(df)
+                      send_dynatrace(app,f"{app} patched successfully after retry")
+              else:
+                  df.at[idx,'status'] = "Success"
+                  df.at[idx,'app_restart'] = "Success"
+                  post_teams_table(df)
+                  send_dynatrace(app,f"{app} patched successfully")
 
-              post_teams_table(df, msg="Final Patching Coordination")
-              df.to_csv(CSV_PATH,index=False)
-          except Exception as e:
-              print(f"Error executing patching workflow: {e}")
+          # Final coordination table
+          post_teams_table(df)
+          df.to_csv(CSV_PATH,index=False)
           PY
