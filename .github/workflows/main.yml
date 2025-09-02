@@ -29,26 +29,18 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install pandas requests pytz tabulate boto3
+        run: pip install pandas requests pytz boto3
 
       - name: Step 1: Send Schedule CSV
         run: |
           python <<'PY'
           import pandas as pd, os, requests
-          from tabulate import tabulate
           TEAMS_URL = os.getenv("TEAMS_WEBHOOK_URL")
           CSV_PATH = os.getenv("CSV_PATH")
 
           df = pd.read_csv(CSV_PATH)
-          table = tabulate(df, headers="keys", tablefmt="github")
-          payload = {
-              "@type": "MessageCard",
-              "@context": "http://schema.org/extensions",
-              "themeColor": "0076D7",
-              "summary": "Patching Schedule",
-              "sections": [{"activityTitle":"📋 Current Schedule","text":"Schedule before patching."},{"text":table}]
-          }
-          requests.post(TEAMS_URL,json=payload)
+          text = "📋 Patching Schedule:\n" + df.to_string(index=False)
+          requests.post(TEAMS_URL, json={"text": text})
           PY
 
       - name: Step 2: Reminder Before Patching
@@ -68,12 +60,29 @@ jobs:
               if row['Environment'] != TARGET_ENV: continue
               start = TZ.localize(datetime.strptime(row['start Date'],"%d-%m-%Y %H:%M:%S"))
               if start - timedelta(minutes=5) <= now < start:
-                  msg = f"⏰ Reminder: Patching starts in 5 minutes for **{row['App Name']}** (Owner: {row['Owner']})"
-                  payload = {"@type":"MessageCard","@context":"http://schema.org/extensions","themeColor":"0076D7","summary":"Patching Reminder","sections":[{"activityTitle":msg}]}
-                  requests.post(TEAMS_URL,json=payload)
+                  msg = f"⏰ Reminder: Patching starts in 5 minutes for {row['App Name']} (Owner: {row['Owner']})"
+                  requests.post(TEAMS_URL, json={"text": msg})
           PY
 
-      - name: Step 3: Patching Started
+      - name: Step 2a: Auto-Approval
+        run: |
+          python <<'PY'
+          import pandas as pd, os, requests
+          TEAMS_URL = os.getenv("TEAMS_WEBHOOK_URL")
+          CSV_PATH = os.getenv("CSV_PATH")
+
+          df = pd.read_csv(CSV_PATH)
+          changed = False
+          for idx,row in df.iterrows():
+              if str(row.get("approval_status","")).lower() != "approved":
+                  df.at[idx,"approval_status"] = "approved"
+                  requests.post(TEAMS_URL,json={"text":f"✅ Auto-approved: {row['App Name']} will start patching automatically."})
+                  changed = True
+          if changed:
+              df.to_csv(CSV_PATH, index=False)
+          PY
+
+      - name: Step 3: Patching Started + Health Check + Restart
         run: |
           python <<'PY'
           import pandas as pd, os, requests, time, pytz, boto3
@@ -95,8 +104,7 @@ jobs:
               )
 
           def health_check(url):
-              import requests
-              try: return requests.get(url,timeout=5).status_code==200
+              try: return requests.get(url, timeout=5).status_code == 200
               except: return False
 
           df = pd.read_csv(CSV_PATH)
@@ -106,33 +114,25 @@ jobs:
               if row['Environment'] != TARGET_ENV: continue
               start = TZ.localize(datetime.strptime(row['start Date'],"%d-%m-%Y %H:%M:%S"))
               stop  = TZ.localize(datetime.strptime(row['stop Date'],"%d-%m-%Y %H:%M:%S"))
-              if start <= now <= stop:
-                  # Post patching started
-                  msg = f"🛑 Patching started for {row['App Name']} (Owner: {row['Owner']})"
-                  requests.post(TEAMS_URL,json={"@type":"MessageCard","@context":"http://schema.org/extensions","themeColor":"0076D7","summary":"Patching Started","sections":[{"activityTitle":msg}]})
-
-                  time.sleep(2)  # simulate patching
-
-                  # Health check
+              approval = str(row.get("approval_status","")).lower()
+              if start <= now <= stop and approval=="approved":
+                  requests.post(TEAMS_URL,json={"text":f"🛑 Patching started for {row['App Name']} (Owner: {row['Owner']})"})
+                  time.sleep(2)
                   url = row['health URL']
                   cmd = row['Command']
                   if health_check(url):
-                      msg2 = f"💚 Health check passed: {row['App Name']} is healthy"
-                      requests.post(TEAMS_URL,json={"@type":"MessageCard","@context":"http://schema.org/extensions","themeColor":"00FF00","summary":"Health Check","sections":[{"activityTitle":msg2}]})
+                      requests.post(TEAMS_URL,json={"text":f"💚 Health check passed: {row['App Name']} is healthy"})
                   else:
-                      msg2 = f"❌ Health failed: {row['App Name']}. Restarting via SSM..."
-                      requests.post(TEAMS_URL,json={"@type":"MessageCard","@context":"http://schema.org/extensions","themeColor":"FF0000","summary":"Health Check","sections":[{"activityTitle":msg2}]})
-                      if cmd!="-": restart(cmd)
+                      requests.post(TEAMS_URL,json={"text":f"❌ Health failed: {row['App Name']}. Restarting via SSM..."})
+                      if cmd != "-": restart(cmd)
                       time.sleep(5)
                       if health_check(url):
-                          msg3 = f"💚 Health restored: {row['App Name']} is healthy after restart"
-                          requests.post(TEAMS_URL,json={"@type":"MessageCard","@context":"http://schema.org/extensions","themeColor":"00FF00","summary":"Health Restored","sections":[{"activityTitle":msg3}]})
+                          requests.post(TEAMS_URL,json={"text":f"💚 Health restored: {row['App Name']} is healthy after restart"})
                       else:
-                          msg3 = f"⚠ Still unhealthy: {row['App Name']} failed recovery"
-                          requests.post(TEAMS_URL,json={"@type":"MessageCard","@context":"http://schema.org/extensions","themeColor":"FF0000","summary":"Health Failed","sections":[{"activityTitle":msg3}]})
+                          requests.post(TEAMS_URL,json={"text":f"⚠ Still unhealthy: {row['App Name']} failed recovery"})
           PY
 
-      - name: Step 4: Health Check Outside Window & Restart Simulation
+      - name: Step 4: Health Check Outside Window + Simulate Restart
         run: |
           python <<'PY'
           import pandas as pd, os, requests, pytz, time, random
@@ -148,7 +148,7 @@ jobs:
           def restart(cmd):
               return ssm.send_command(InstanceIds=[EC2_INSTANCE_ID],DocumentName="AWS-RunShellScript",Parameters={"commands":[cmd]},TimeoutSeconds=60)
           def health_check(url):
-              try: return requests.get(url,timeout=5).status_code==200
+              try: return requests.get(url, timeout=5).status_code == 200
               except: return False
 
           df = pd.read_csv(CSV_PATH)
@@ -159,26 +159,19 @@ jobs:
               stop  = TZ.localize(datetime.strptime(row['stop Date'],"%d-%m-%Y %H:%M:%S"))
               url = row['health URL']
               cmd = row['Command']
-              # Outside window
               if now < start or now > stop:
                   if health_check(url):
-                      msg = f"💡 Health check: {row['App Name']} is healthy"
-                      requests.post(TEAMS_URL,json={"@type":"MessageCard","@context":"http://schema.org/extensions","themeColor":"0076D7","summary":"Health Check","sections":[{"activityTitle":msg}]})
-                      # Randomly simulate stop/restart one app
+                      requests.post(TEAMS_URL,json={"text":f"💡 Health check: {row['App Name']} is healthy"})
                       if random.choice([True,False]):
-                          msg2 = f"🔄 Simulate stop & restart: {row['App Name']}"
-                          requests.post(TEAMS_URL,json={"@type":"MessageCard","@context":"http://schema.org/extensions","themeColor":"FFA500","summary":"Simulate Restart","sections":[{"activityTitle":msg2}]})
-                          if cmd!="-": restart(cmd)
+                          requests.post(TEAMS_URL,json={"text":f"🔄 Simulate stop & restart: {row['App Name']}"})
+                          if cmd != "-": restart(cmd)
                           time.sleep(5)
                           if health_check(url):
-                              msg3 = f"💚 Health restored: {row['App Name']} is healthy after restart"
-                              requests.post(TEAMS_URL,json={"@type":"MessageCard","@context":"http://schema.org/extensions","themeColor":"00FF00","summary":"Health Restored","sections":[{"activityTitle":msg3}]})
+                              requests.post(TEAMS_URL,json={"text":f"💚 Health restored: {row['App Name']} after restart"})
                           else:
-                              msg3 = f"⚠ Still unhealthy: {row['App Name']} failed recovery"
-                              requests.post(TEAMS_URL,json={"@type":"MessageCard","@context":"http://schema.org/extensions","themeColor":"FF0000","summary":"Health Failed","sections":[{"activityTitle":msg3}]})
+                              requests.post(TEAMS_URL,json={"text":f"⚠ Still unhealthy: {row['App Name']} failed recovery"})
                   else:
-                      msg = f"⚠ Health check failed outside window: {row['App Name']} is unhealthy"
-                      requests.post(TEAMS_URL,json={"@type":"MessageCard","@context":"http://schema.org/extensions","themeColor":"FF0000","summary":"Health Failed","sections":[{"activityTitle":msg}]})
+                      requests.post(TEAMS_URL,json={"text":f"⚠ Health check failed outside window: {row['App Name']} is unhealthy"})
           PY
 
       - name: Step 5: Dynatrace Alerts
@@ -189,9 +182,7 @@ jobs:
           DYNATRACE_API_TOKEN = os.getenv("DYNATRACE_API_TOKEN")
           TEAMS_URL = os.getenv("TEAMS_WEBHOOK_URL")
 
-          def post_teams(title,message,color="0076D7"):
-              payload={"@type":"MessageCard","@context":"http://schema.org/extensions","themeColor":color,"summary":title,"sections":[{"activityTitle":title,"text":message}]}
-              requests.post(TEAMS_URL,json=payload)
+          def post(text): requests.post(TEAMS_URL,json={"text":text})
 
           try:
               url=f"https://{DYNATRACE_ENV_ID}.live.dynatrace.com/api/v2/problems"
@@ -202,8 +193,7 @@ jobs:
               problems = r.json().get("problems",[])
               for p in problems:
                   entities=", ".join([e['entityId'] for e in p.get("affectedEntities",[])])
-                  color={"ERROR":"FF0000","WARNING":"FFA500","INFO":"0076D7"}.get(p["severity"],"0076D7")
-                  post_teams(f"⚠ Dynatrace Alert: {p['title']}", f"Severity: {p['severity']}\nAffected Entities: {entities}", color=color)
+                  post(f"⚠ Dynatrace Alert: {p['title']}\nSeverity: {p['severity']}\nAffected Entities: {entities}")
           except Exception as e:
-              post_teams("Dynatrace fetch failed", str(e), color="FF0000")
+              post(f"Dynatrace fetch failed: {e}")
           PY
