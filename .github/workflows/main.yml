@@ -207,13 +207,13 @@ jobs:
                       table = make_table(app, iid, start, stop, url)
 
                       if start <= now <= stop:
-                          # inside window → stopping
-                          post_teams(f"🛑 Patching window active: **{app}** stopping on `{iid}`", "Info", table=table)
+                          # inside window → patching reminder + stopping
+                          post_teams(f"🛑 Patching started for **{app}** on `{iid}`", "Info", table=table)
                           rc, _, err = ssm_run(iid, cmd.replace("start", "stop"))
                           if rc != 0:
                               post_teams(f"❌ Failed to stop {app} on {iid}: {err}", "Alert", table=table)
                       else:
-                          # outside window → restarting + health
+                          # outside window → restart + done reminder
                           post_teams(f"🔄 Restarting **{app}** on `{iid}`", "Info", table=table)
                           rc, _, err = ssm_run(iid, cmd)
                           if rc != 0:
@@ -223,9 +223,9 @@ jobs:
                           if url:
                               status, _ = http_status_via_ssm(iid, url)
                               if status == 200:
-                                  post_teams(f"✅ {app} healthy after restart", "Info", table=table)
+                                  post_teams(f"✅ Patching done for **{app}** — App is healthy", "Info", table=table)
                               else:
-                                  post_teams(f"❌ {app} NOT healthy after restart (status {status})", "Alert", table=table)
+                                  post_teams(f"❌ {app} NOT healthy after patching (status {status})", "Alert", table=table)
 
                   except Exception as e:
                       post_teams(f"❌ Unexpected error for row: {e}", "Alert")
