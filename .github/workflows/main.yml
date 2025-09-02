@@ -3,7 +3,7 @@ name: Patching Control + Teams + Auto-Restart
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/5 * * * *"  # check every 5 mins for reminders & patching
+    - cron: "*/5 * * * *"  # checks every 5 minutes
 
 jobs:
   patching-check:
@@ -14,6 +14,8 @@ jobs:
       TARGET_ENV: Production
       TZ: Asia/Kolkata
       TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
 
     steps:
       - name: Checkout
@@ -25,12 +27,12 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install pandas requests pytz tabulate
+        run: pip install pandas requests pytz tabulate boto3
 
-      - name: Patching + Reminders + Approval + Health Check
+      - name: Patching + Reminders + Auto-Approval + Health Check + Auto-Restart
         run: |
           python <<'PY'
-          import pandas as pd, os, time, requests, subprocess, re
+          import pandas as pd, os, time, requests, re, boto3
           from datetime import datetime, timedelta
           import pytz
           from tabulate import tabulate
@@ -39,6 +41,10 @@ jobs:
           TARGET_ENV = os.getenv("TARGET_ENV", "Production")
           TZ = pytz.timezone(os.getenv("TZ", "Asia/Kolkata"))
           TEAMS_URL = os.getenv("TEAMS_WEBHOOK_URL")
+          AWS_REGION = os.getenv("AWS_REGION")
+          EC2_INSTANCE_ID = os.getenv("EC2_INSTANCE_ID")
+
+          ssm = boto3.client("ssm", region_name=AWS_REGION)
 
           COLS = {
               "app":"app_name",
@@ -57,19 +63,26 @@ jobs:
               for k,v in COLS.items():
                   if v not in df.columns:
                       df[v] = "-"
+              if "approval_status" not in df.columns:
+                  df["approval_status"] = ""
               return df
 
           def make_table(df):
               return tabulate(df[list(COLS.values())], headers="keys", tablefmt="github")
 
-          def post_teams(title, message, table=None, approve_url=None, color="0076D7"):
+          def post_teams(title, message, table=None, approve_url=None, color="0076D7", file=None):
               if not TEAMS_URL: return
               sections=[{"activityTitle":title,"text":message}]
               if table: sections.append({"text":table})
               if approve_url:
                   sections.append({"potentialAction":[{"@type":"OpenUri","name":"Approve","targets":[{"os":"default","uri":approve_url}]}]})
               payload={"@type":"MessageCard","@context":"http://schema.org/extensions","themeColor":color,"summary":title,"sections":sections}
-              try: requests.post(TEAMS_URL,json=payload,timeout=10)
+              try:
+                  if file:
+                      files = {'file': open(file,'rb')}
+                      requests.post(TEAMS_URL, files=files, timeout=10)
+                  else:
+                      requests.post(TEAMS_URL,json=payload,timeout=10)
               except Exception as e: print(f"[teams] send failed: {e}")
 
           def save_df(df): df.to_csv(CSV_PATH,index=False)
@@ -83,6 +96,18 @@ jobs:
           def health_check(url):
               try: return requests.get(url, timeout=5).status_code==200
               except: return False
+
+          def restart_app_ssm(cmd, instance_id):
+              try:
+                  resp = ssm.send_command(
+                      InstanceIds=[instance_id],
+                      DocumentName="AWS-RunShellScript",
+                      Parameters={"commands":[cmd]},
+                      TimeoutSeconds=60,
+                  )
+                  return resp
+              except Exception as e:
+                  return str(e)
 
           df = normalize(pd.read_csv(CSV_PATH))
           now = datetime.now(TZ)
@@ -104,28 +129,21 @@ jobs:
               # 1-week reminder
               if start - timedelta(days=7) <= now < start - timedelta(days=6, hours=23, minutes=55):
                   post_teams("⏰ Reminder: Patching in 1 week",
-                             f"Patching for **{app}**. Owner: {owner}", table)
+                             f"Patching for **{app}**. Owner: {owner}", table, file=CSV_PATH)
                   continue
 
               # 5-min reminder
               if start - timedelta(minutes=5) <= now < start - timedelta(minutes=4, seconds=55):
                   post_teams("⏰ Reminder: Patching starts in 5 minutes",
-                             f"Patching for **{app}**. Owner: {owner}", table)
+                             f"Patching for **{app}**. Owner: {owner}", table, file=CSV_PATH)
                   continue
 
-              # Approval request if not yet approved
-              if approval != "approved" and now < start:
-                  approve_link = f"https://your-server.com/approve?app={app}&idx={idx}"
-                  post_teams(f"📝 Approval required: {app}", f"Owner: {owner}, please approve patching.", table, approve_link)
-                  # wait up to 30 mins
-                  for _ in range(60):
-                      df = normalize(pd.read_csv(CSV_PATH))
-                      approval = df.at[idx,COLS["approval"]].lower()
-                      if approval=="approved": break
-                      time.sleep(30)
-                  else:
-                      post_teams(f"⚠ Skipped: {app}", f"No approval received.", table)
-                      continue
+              # Auto-approval
+              if approval != "approved":
+                  df.at[idx, COLS["approval"]] = "approved"
+                  save_df(df)
+                  approval = "approved"
+                  post_teams(f"✅ Auto-approved: {app}", f"Patching will start automatically.", table, file=CSV_PATH)
 
               # Start patching
               if approval=="approved" and start <= now <= stop:
@@ -138,18 +156,15 @@ jobs:
                   if healthy:
                       post_teams(f"💚 Health check passed: {app}", f"{app} is healthy", table)
                   else:
-                      post_teams(f"❌ Health check failed: {app}", f"{app} is unhealthy. Restarting...", table, color="FF0000")
+                      post_teams(f"❌ Health check failed: {app}", f"{app} is unhealthy. Restarting via SSM...", table, color="FF0000")
                       if cmd and cmd!="-":
-                          try:
-                              subprocess.run(cmd, shell=True, check=True)
-                              post_teams(f"🔄 App restarted: {app}", f"Restart command executed. Re-checking health.", table)
-                              time.sleep(5)
-                              if health_check(url):
-                                  post_teams(f"💚 Health restored: {app}", f"{app} is now healthy.", table)
-                              else:
-                                  post_teams(f"⚠ Still unhealthy: {app}", f"{app} failed to recover automatically.", table, color="FF0000")
-                          except Exception as e:
-                              post_teams(f"⚠ Restart failed: {app}", f"Error: {e}", table, color="FF0000")
+                          resp = restart_app_ssm(cmd, EC2_INSTANCE_ID)
+                          post_teams(f"🔄 Restart triggered via SSM: {app}", f"Response: {resp}", table)
+                          time.sleep(5)
+                          if health_check(url):
+                              post_teams(f"💚 Health restored: {app}", f"{app} is now healthy.", table)
+                          else:
+                              post_teams(f"⚠ Still unhealthy: {app}", f"{app} failed to recover automatically.", table, color="FF0000")
 
               # Outside patching window: normal health check
               if now < start or now > stop:
@@ -157,5 +172,3 @@ jobs:
                   if healthy:
                       post_teams(f"💡 Health check: {app}", f"{app} is healthy", table)
                   else:
-                      post_teams(f"⚠ Health check failed outside window: {app}", f"{app} unhealthy.", table, color="FF0000")
-
