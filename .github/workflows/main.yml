@@ -47,7 +47,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install boto3 requests pandas pytz
 
-      - name: Run patching workflow
+      - name: Run pre-check, restart & patching
         run: |
           python <<'PY'
           import os, time, requests, pandas as pd, boto3, pytz
@@ -58,7 +58,7 @@ jobs:
               print("❌ Patching not approved. Exiting.")
               exit(0)
 
-          print("✅ Approval received. Starting patching...")
+          print("✅ Approval received. Starting pre-checks and patching...")
 
           CSV_PATH = os.getenv("CSV_PATH")
           TARGET_ENV = os.getenv("TARGET_ENV")
@@ -104,7 +104,36 @@ jobs:
               except Exception as e:
                   return 1,"",f"SSM error: {e}"
 
-          # Load CSV
+          def http_status_via_ssm(instance_id, url):
+              if not url: return None,"no url"
+              shell = f'curl -sS -m 8 -w "\\nHTTP_STATUS:%{{http_code}}" "{url}" || true'
+              code, out, err = ssm_run(instance_id, shell)
+              if code != 0: return None, err or out
+              status = None
+              if "HTTP_STATUS:" in out:
+                  try: status = int(out.rsplit("HTTP_STATUS:",1)[1].strip())
+                  except: status = None
+              return status, out
+
+          def ensure_online(instance_id):
+              try:
+                  resp = ssm.describe_instance_information(Filters=[{"Key":"InstanceIds","Values":[instance_id]}])
+                  if resp["InstanceInformationList"]:
+                      return resp["InstanceInformationList"][0]["PingStatus"]=="Online"
+              except: pass
+              return False
+
+          def send_dynatrace_success(app):
+              if not DYNATRACE_ENV_ID or not DYNATRACE_API_TOKEN: return
+              try:
+                  url = f"https://{DYNATRACE_ENV_ID}.live.dynatrace.com/api/v2/events"
+                  headers = {"Authorization": f"Api-Token {DYNATRACE_API_TOKEN}"}
+                  payload = {"eventType":"CUSTOM_ANNOTATION","attachRules":{"entityIds":[]},
+                             "source":"GitHub Actions","description":f"Patching successful: {app}"}
+                  requests.post(url, headers=headers, json=payload, timeout=5)
+              except Exception as e:
+                  print(f"[dynatrace] failed: {e}")
+
           df = pd.read_csv(CSV_PATH)
           df.columns = [c.strip().lower().replace(" ","_") for c in df.columns]
           now = datetime.now(TZ)
@@ -116,7 +145,6 @@ jobs:
 
           df.to_csv(CSV_PATH,index=False)
 
-          # Execute patching
           for idx,row in df.iterrows():
               app = row['app_name']
               cmd = row['command']
@@ -126,11 +154,29 @@ jobs:
               stop  = pd.to_datetime(row['stop_date'])
               if start.tzinfo is None: start = TZ.localize(start)
               if stop.tzinfo is None: stop = TZ.localize(stop)
-              if start <= now <= stop:
-                  post_teams(f"▶️ Running patching for {app} on {iid}", "Info")
-                  rc,out,err = ssm_run(iid, cmd)
-                  if rc != 0:
-                      post_teams(f"❌ Patching failed for {app}: {err or out}","Alert")
-                  else:
-                      post_teams(f"✅ Patching succeeded for {app}","Info")
+
+              if not ensure_online(iid):
+                  post_teams(f"❌ {app}: {iid} not online in SSM","Alert")
+                  continue
+
+              # Pre-check / Stop existing container
+              stop_cmd = cmd.replace("start","stop")
+              post_teams(f"🔹 Pre-check: stopping {app} if running: `{stop_cmd}`","Info")
+              ssm_run(iid, stop_cmd)
+              time.sleep(5)
+
+              # Restart / patching
+              post_teams(f"▶️ Starting {app} on {iid}: `{cmd}`","Info")
+              rc, out, err = ssm_run(iid, cmd)
+              if rc != 0:
+                  post_teams(f"❌ Patching failed for {app}: {err or out}","Alert")
+                  continue
+
+              time.sleep(8)
+              status,_ = http_status_via_ssm(iid, url)
+              if status == 200:
+                  post_teams(f"✅ {app} healthy after patching","Info")
+                  send_dynatrace_success(app)
+              else:
+                  post_teams(f"❌ {app} NOT healthy after patching (status {status})","Alert")
 PY
