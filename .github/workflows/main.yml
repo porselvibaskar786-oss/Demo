@@ -15,8 +15,6 @@ jobs:
       TZ: Asia/Kolkata
       TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
       AWS_REGION: ${{ secrets.AWS_REGION }}
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
       DYNATRACE_ENV_ID: ${{ secrets.DYNATRACE_ENV_ID }}
       DYNATRACE_API_TOKEN: ${{ secrets.DYNATRACE_API_TOKEN }}
@@ -24,13 +22,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -40,7 +31,7 @@ jobs:
       - name: Install dependencies
         run: pip install pandas requests pytz boto3
 
-      - name: Step 1: Send Schedule CSV to Teams
+      - name: Step 1: Send Schedule CSV
         run: |
           python <<'PY'
           import pandas as pd, os, requests
@@ -54,30 +45,37 @@ jobs:
       - name: Step 2: Reminder Before Patching
         run: |
           python <<'PY'
-          import pandas as pd, os, requests, pytz, time
+          import pandas as pd, os, requests, pytz
           from datetime import datetime, timedelta
           TEAMS_URL = os.getenv("TEAMS_WEBHOOK_URL")
           CSV_PATH = os.getenv("CSV_PATH")
           TZ = pytz.timezone(os.getenv("TZ"))
           TARGET_ENV = os.getenv("TARGET_ENV")
-
           df = pd.read_csv(CSV_PATH, sep="\t")
           now = datetime.now(TZ)
 
-          for idx, row in df.iterrows():
+          for idx,row in df.iterrows():
               if row['Environment'] != TARGET_ENV: continue
               start = TZ.localize(datetime.strptime(row['start Date'],"%d-%m-%Y %H:%M:%S"))
               if start - timedelta(minutes=5) <= now < start:
                   msg = f"⏰ Reminder: Patching starts in 5 minutes for {row['App Name']} (Owner: {row['Owner']})"
                   requests.post(TEAMS_URL, json={"text": msg})
+          PY
 
-              # Auto-approval
-              approval = str(row.get("approval_status","")).lower()
-              if approval != "approved":
+      - name: Step 2a: Auto-Approval
+        run: |
+          python <<'PY'
+          import pandas as pd, os, requests
+          TEAMS_URL = os.getenv("TEAMS_WEBHOOK_URL")
+          CSV_PATH = os.getenv("CSV_PATH")
+          df = pd.read_csv(CSV_PATH, sep="\t")
+          changed = False
+          for idx,row in df.iterrows():
+              if str(row.get("approval_status","")).lower() != "approved":
                   df.at[idx,"approval_status"] = "approved"
                   requests.post(TEAMS_URL,json={"text":f"✅ Auto-approved: {row['App Name']} will start patching automatically."})
-
-          df.to_csv(CSV_PATH, sep="\t", index=False)
+                  changed = True
+          if changed: df.to_csv(CSV_PATH, sep="\t", index=False)
           PY
 
       - name: Step 3: Patching + Health Check + Restart
@@ -93,17 +91,17 @@ jobs:
           AWS_REGION = os.getenv("AWS_REGION")
           ssm = boto3.client("ssm", region_name=AWS_REGION)
 
+          def post(msg): requests.post(TEAMS_URL,json={"text":msg})
           def restart(cmd):
-              if not cmd or cmd=="-": return
-              return ssm.send_command(
-                  InstanceIds=[EC2_INSTANCE_ID],
-                  DocumentName="AWS-RunShellScript",
-                  Parameters={"commands":[cmd]},
-                  TimeoutSeconds=60
-              )
-
+              if cmd and cmd!="-":
+                  return ssm.send_command(
+                      InstanceIds=[EC2_INSTANCE_ID],
+                      DocumentName="AWS-RunShellScript",
+                      Parameters={"commands":[cmd]},
+                      TimeoutSeconds=60
+                  )
           def health_check(url):
-              try: return requests.get(url, timeout=5).status_code == 200
+              try: return requests.get(url, timeout=5).status_code==200
               except: return False
 
           df = pd.read_csv(CSV_PATH, sep="\t")
@@ -118,47 +116,54 @@ jobs:
               cmd = row['Command']
               app = row['App Name']
 
-              # Inside window: patching
+              # Inside patching window
               if start <= now <= stop and approval=="approved":
-                  requests.post(TEAMS_URL,json={"text":f"🛑 Patching started for {app} (Owner: {row['Owner']})"})
+                  post(f"🛑 Patching started for {app} (Owner: {row['Owner']})")
                   time.sleep(2)
                   if health_check(url):
-                      requests.post(TEAMS_URL,json={"text":f"💚 Health check passed: {app} is healthy"})
+                      post(f"💚 Health check passed: {app} is healthy")
                   else:
-                      requests.post(TEAMS_URL,json={"text":f"❌ Health failed: {app}. Restarting via SSM..."})
+                      post(f"❌ Health failed: {app}. Restarting via SSM...")
                       restart(cmd)
                       time.sleep(5)
                       if health_check(url):
-                          requests.post(TEAMS_URL,json={"text":f"💚 Health restored: {app} is healthy after restart"})
+                          post(f"💚 App is healthy after restart: {app}")
                       else:
-                          requests.post(TEAMS_URL,json={"text":f"⚠ Still unhealthy: {app} failed recovery"})
+                          post(f"⚠ Still unhealthy: {app} failed recovery")
 
-              # Outside window: normal health check + self-healing
+              # Outside patching window
               elif now < start or now > stop:
                   if health_check(url):
-                      requests.post(TEAMS_URL,json={"text":f"💡 Health check: {app} is healthy"})
-                      # Randomly simulate stop & restart for demo
-                      if row['App Name'] == "AIT No 2":
-                          requests.post(TEAMS_URL,json={"text":f"🔄 Simulate stop & restart: {app}"})
+                      post(f"💡 Health check: {app} is healthy")
+                      # Optional simulated restart
+                      import random
+                      if random.choice([True, False]):
+                          post(f"🔄 Simulate stop & restart for {app}")
                           restart(cmd)
                           time.sleep(5)
                           if health_check(url):
-                              requests.post(TEAMS_URL,json={"text":f"💚 Health restored: {app} after restart"})
+                              post(f"💚 App is healthy after simulated restart: {app}")
                           else:
-                              requests.post(TEAMS_URL,json={"text":f"⚠ Still unhealthy: {app} failed recovery"})
+                              post(f"⚠ Still unhealthy: {app} after simulated restart")
                   else:
-                      requests.post(TEAMS_URL,json={"text":f"⚠ Health check failed outside window: {app} is unhealthy"})
+                      post(f"⚠ Health check failed: {app} is unhealthy. Restarting...")
+                      restart(cmd)
+                      time.sleep(5)
+                      if health_check(url):
+                          post(f"💚 App is healthy after restart: {app}")
+                      else:
+                          post(f"⚠ Still unhealthy: {app} failed recovery")
           PY
 
       - name: Step 4: Dynatrace Alerts
         run: |
           python <<'PY'
           import os, requests
+          TEAMS_URL = os.getenv("TEAMS_WEBHOOK_URL")
           DYNATRACE_ENV_ID = os.getenv("DYNATRACE_ENV_ID")
           DYNATRACE_API_TOKEN = os.getenv("DYNATRACE_API_TOKEN")
-          TEAMS_URL = os.getenv("TEAMS_WEBHOOK_URL")
 
-          def post(text): requests.post(TEAMS_URL,json={"text":text})
+          def post(msg): requests.post(TEAMS_URL,json={"text":msg})
 
           try:
               url=f"https://{DYNATRACE_ENV_ID}.live.dynatrace.com/api/v2/problems"
