@@ -45,7 +45,7 @@ jobs:
         run: |
           cat > windowed_health_check_ssm.py <<'PY'
           import os, re, time
-          from datetime import datetime
+          from datetime import datetime, timedelta
           import pandas as pd
           import requests, boto3, pytz
 
@@ -206,14 +206,19 @@ jobs:
 
                       table = make_table(app, iid, start, stop, url)
 
+                      # 1 week prior reminder
+                      if start - timedelta(days=7) <= now < start - timedelta(days=6, hours=23):
+                          post_teams(f"⏰ Reminder: Patching for **{app}** in 1 week.", "Info", table=table)
+                          continue
+
                       if start <= now <= stop:
-                          # inside window → patching reminder + stopping
+                          # inside window → patching started
                           post_teams(f"🛑 Patching started for **{app}** on `{iid}`", "Info", table=table)
                           rc, _, err = ssm_run(iid, cmd.replace("start", "stop"))
                           if rc != 0:
                               post_teams(f"❌ Failed to stop {app} on {iid}: {err}", "Alert", table=table)
-                      else:
-                          # outside window → restart + done reminder
+                      elif now > stop:
+                          # after window → restart
                           post_teams(f"🔄 Restarting **{app}** on `{iid}`", "Info", table=table)
                           rc, _, err = ssm_run(iid, cmd)
                           if rc != 0:
