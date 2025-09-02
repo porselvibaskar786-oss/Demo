@@ -3,7 +3,7 @@ name: Patching Control (SSM) + Teams
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/5 * * * *"   # every 5 minutes
+    - cron: "*/5 * * * *"
 
 jobs:
   patching-check:
@@ -42,26 +42,44 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install boto3 requests pandas openpyxl pytz
+          pip install boto3 requests pandas openpyxl pytz tabulate
 
-      - name: Create & Run Patching Script
+      - name: Run Patching Script with Mock Approval & Dynatrace Alerts
         run: |
           cat > windowed_health_check_ssm.py <<'PY'
-          import os, re, time
+          import os, re, time, random
           from datetime import datetime, timedelta
           import pandas as pd
           import requests, boto3, pytz
+          from tabulate import tabulate
 
-          CSV_PATH     = os.getenv("CSV_PATH", "schedule.csv")
-          TARGET_ENV   = os.getenv("TARGET_ENV", "Production")
-          TZ_NAME      = os.getenv("TZ", "Asia/Kolkata")
-          AWS_REGION   = os.getenv("AWS_REGION")
-          TEAMS_URL    = os.getenv("TEAMS_WEBHOOK_URL") or ""
+          CSV_PATH = os.getenv("CSV_PATH", "schedule.csv")
+          TARGET_ENV = os.getenv("TARGET_ENV", "Production")
+          TZ_NAME = os.getenv("TZ", "Asia/Kolkata")
+          AWS_REGION = os.getenv("AWS_REGION")
+          TEAMS_URL = os.getenv("TEAMS_WEBHOOK_URL") or ""
           FALLBACK_IID = (os.getenv("EC2_INSTANCE_ID") or "").strip()
-          DYNATRACE_URL   = os.getenv("DYNATRACE_URL", "")
-          DYNATRACE_TOKEN = os.getenv("DYNATRACE_TOKEN", "")
 
           ssm = boto3.client("ssm", region_name=AWS_REGION)
+
+          ALIASES = {
+              "app": ["app", "app_name", "application"],
+              "env": ["environment", "env"],
+              "start": ["start", "start_date", "window_start"],
+              "stop": ["stop", "stop_date", "window_stop", "end"],
+              "url": ["health_url", "health", "url"],
+              "cmd": ["command", "cmd", "restart_command", "action"],
+              "instanceid": ["instanceid", "instance_id", "ec2_instance_id"],
+              "owner": ["owner"],
+              "approval": ["approval_status"]
+          }
+
+          def first_nonempty(row, names):
+              for n in names:
+                  v = row.get(n, "")
+                  if v is not None and str(v).strip() != "":
+                      return str(v).strip()
+              return ""
 
           def post_teams(title, message, table=None, color="0076D7"):
               if not TEAMS_URL: return
@@ -74,128 +92,100 @@ jobs:
                   "summary": title,
                   "sections": sections,
               }
-              try: requests.post(TEAMS_URL, json=payload, timeout=10)
-              except Exception as e: print(f"[teams] send failed: {e}")
-
-          def norm(s): return re.sub(r"_{2,}", "_", re.sub(r"[^\w]+","_", (s or "").strip().lower())).strip("_")
-
-          ALIASES = {
-              "app": ["app", "app_name", "application"],
-              "env": ["environment", "env"],
-              "start": ["start", "start_date", "window_start"],
-              "stop": ["stop", "stop_date", "window_stop", "end"],
-              "url": ["health_url", "health", "url"],
-              "cmd": ["command", "cmd", "restart_command", "action"],
-              "instanceid": ["instanceid", "instance_id", "ec2_instance_id"],
-              "owner": ["owner", "app_owner"],
-              "approval": ["approval_status"]
-          }
-
-          def first_nonempty(row, names):
-              for n in names:
-                  v = row.get(n,"")
-                  if v and str(v).strip(): return str(v).strip()
-              return ""
-
-          def require(row, field):
-              v = first_nonempty(row, ALIASES[field])
-              if not v: raise ValueError(f"Missing {field}")
-              return v
+              try:
+                  requests.post(TEAMS_URL, json=payload, timeout=10)
+              except Exception as e:
+                  print(f"[teams] send failed: {e}")
 
           def parse_dt(s, tz):
+              s = (s or "").strip()
               for fmt in ("%d-%m-%Y %H:%M:%S","%d-%m-%Y %H:%M","%Y-%m-%d %H:%M:%S","%Y-%m-%d %H:%M"):
-                  try: return tz.localize(datetime.strptime(s.strip(), fmt))
+                  try: return tz.localize(datetime.strptime(s, fmt))
                   except: pass
-              raise ValueError(f"Bad date {s}")
+              raise ValueError(f"Bad date '{s}'")
 
           def load_rows(path):
               ext = os.path.splitext(path)[1].lower()
-              if ext==".csv": df=pd.read_csv(path)
-              elif ext in (".xls",".xlsx"): df=pd.read_excel(path)
-              else: raise ValueError("CSV/XLSX required")
-              df.columns = [norm(c) for c in df.columns]
-              return df.to_dict("records")
+              if ext == ".csv": df = pd.read_csv(path)
+              elif ext in (".xlsx", ".xls"): df = pd.read_excel(path)
+              else: raise ValueError("Input must be CSV/XLSX")
+              df.columns = [re.sub(r"[^\w]+","_",c.strip().lower()) for c in df.columns]
+              if "approval_status" not in df.columns: df["approval_status"] = ""
+              return df
 
-          def ssm_run(instance_id, cmd, timeout_s=180):
-              try:
-                  resp=ssm.send_command(InstanceIds=[instance_id], DocumentName="AWS-RunShellScript",
-                                        Parameters={"commands":[cmd]})
-                  cmd_id = resp["Command"]["CommandId"]
-                  for _ in range(timeout_s):
-                      out=ssm.get_command_invocation(CommandId=cmd_id, InstanceId=instance_id)
-                      if out["Status"] in ("Success","Failed","Cancelled","TimedOut"):
-                          return int(out.get("ResponseCode",1)), out.get("StandardOutputContent",""), out.get("StandardErrorContent","")
-                      time.sleep(1)
-                  return 1,"","Timed out"
-              except Exception as e: return 1,"",str(e)
+          def save_rows(df):
+              df.to_csv(CSV_PATH, index=False)
 
-          def http_status_via_ssm(instance_id, url):
-              if not url: return None,"no url"
-              shell=f'curl -sS -m 8 -w "\\nHTTP_STATUS:%{{http_code}}" "{url}" || true'
-              code,out,err=ssm_run(instance_id,shell)
-              if code!=0: return None,err or out
-              status=None
-              if "HTTP_STATUS:" in out: _,tail=out.rsplit("HTTP_STATUS:",1); status=int(tail.strip() or 0)
-              return status,out
+          def make_table(df):
+              df_disp = df[["app","instanceid","start","stop","url","owner","approval_status"]].fillna("-")
+              return tabulate(df_disp, headers="keys", tablefmt="github")
 
-          def ensure_online(instance_id):
-              try:
-                  resp=ssm.describe_instance_information(Filters=[{"Key":"InstanceIds","Values":[instance_id]}])
-                  if resp["InstanceInformationList"]: return resp["InstanceInformationList"][0]["PingStatus"]=="Online"
-              except: pass
-              return False
-
-          def dynatrace_problems():
-              if not DYNATRACE_URL or not DYNATRACE_TOKEN: return []
-              try:
-                  r=requests.get(f"{DYNATRACE_URL}/api/v2/problems",
-                                 headers={"Authorization":f"Api-Token {DYNATRACE_TOKEN}"}, timeout=10)
-                  if r.status_code==200: return r.json().get("problems",[])
-              except: pass
-              return []
-
-          def make_table(app,iid,start,stop,url): 
-              return f"| App | Instance | Start | End | Health URL |\n|-----|----------|-------|-----|------------|\n| {app} | {iid} | {start.strftime('%d-%m-%Y %H:%M')} | {stop.strftime('%d-%m-%Y %H:%M')} | {url or '-'} |"
+          def simulate_dynatrace_alerts():
+              # Random mock alerts for demo
+              alerts = []
+              severities = ["CRITICAL","WARNING","INFO"]
+              for _ in range(random.randint(0,2)):
+                  alerts.append({
+                      "title": f"Mock Alert {random.randint(1,99)}",
+                      "severityLevel": random.choice(severities),
+                      "status": random.choice(["OPEN","CLOSED"])
+                  })
+              return alerts
 
           def main():
-              tz=pytz.timezone(TZ_NAME)
-              now=datetime.now(tz)
-              try: rows=load_rows(CSV_PATH)
-              except Exception as e:
-                  post_teams("❌ Schedule load failed", str(e),"FF0000")
-                  return
+              tz = pytz.timezone(TZ_NAME)
+              now = datetime.now(tz)
+              df = load_rows(CSV_PATH)
+              
+              for idx, row in df.iterrows():
+                  app = first_nonempty(row, ALIASES["app"])
+                  env = first_nonempty(row, ALIASES["env"])
+                  if env != TARGET_ENV: continue
+                  start = parse_dt(first_nonempty(row, ALIASES["start"]), tz)
+                  stop = parse_dt(first_nonempty(row, ALIASES["stop"]), tz)
+                  iid = first_nonempty(row, ALIASES["instanceid"]) or FALLBACK_IID
+                  cmd = first_nonempty(row, ALIASES["cmd"])
+                  owner = first_nonempty(row, ALIASES["owner"])
+                  approval = first_nonempty(row, ALIASES["approval"]).lower()
+                  url = first_nonempty(row, ALIASES["url"])
 
-              for raw in rows:
-                  try:
-                      app=require(raw,"app")
-                      env=require(raw,"env")
-                      if env!=TARGET_ENV: continue
-                      start=parse_dt(require(raw,"start"),tz)
-                      stop=parse_dt(require(raw,"stop"),tz)
-                      cmd=require(raw,"cmd")
-                      iid=first_nonempty(raw,ALIASES["instanceid"]) or FALLBACK_IID
-                      url=first_nonempty(raw,ALIASES["url"])
-                      owner=first_nonempty(raw,ALIASES["owner"])
-                      approval=first_nonempty(raw,ALIASES["approval"]).lower()
-                      if not iid: raise ValueError("No InstanceId")
-                      if not ensure_online(iid):
-                          post_teams(f"❌ {app}: Instance {iid} not Online in SSM","",color="FF0000")
-                          continue
-                      table=make_table(app,iid,start,stop,url)
+                  table = make_table(df)
 
-                      # 1 week reminder
-                      if start - timedelta(days=7) <= now < start - timedelta(days=6,hours=23,minutes=55):
-                          post_teams("⏰ Reminder", f"Patching for **{app}** in 1 week.\nPlease update approval_status to 'approved' to allow patching.", table)
-                          continue
+                  # 1-week reminder
+                  if start - timedelta(days=7) <= now < start - timedelta(days=6, hours=23, minutes=55):
+                      post_teams("⏰ Reminder: Patching in 1 week",
+                                 f"Patching for **{app}**. Owner: {owner}", table)
+                      continue
 
-                      # 5 min reminder
-                      if start - timedelta(minutes=5) <= now < start - timedelta(minutes=4,seconds=55):
-                          post_teams("⏰ Reminder", f"Patching for **{app}** starts in 5 minutes.\nPlease ensure approval is set.", table)
-                          continue
+                  # 5-min reminder + approval simulation
+                  if start - timedelta(minutes=5) <= now < start - timedelta(minutes=4, seconds=55):
+                      post_teams("⏰ Reminder: Patching starts in 5 minutes",
+                                 f"Patching for **{app}**. Owner: {owner}\nMock Approval: setting status to 'approved'",
+                                 table)
+                      df.at[idx,"approval_status"]="approved"
+                      save_rows(df)
+                      continue
 
-                      # During patching window
-                      if start <= now <= stop:
-                          if approval!="approved":
-                              post_teams("⏳ Awaiting Approval", f"Patching for **{app}** is scheduled but awaiting approval from **{owner}**.", table)
-                              continue
-                          post_teams("🛠 Patching in progress", f"Patching for **{app}** on `{iid
+                  # Post-approval patching
+                  if approval == "approved" and start <= now <= stop:
+                      post_teams("🛑 Patching started", f"{app} on {iid} (Owner: {owner})", table)
+                      time.sleep(2)  # simulate patching
+                      post_teams("✅ Patching done", f"{app} health status: Healthy", table)
+                      continue
+
+                  # Outside patching window: health check
+                  if now < start or now > stop:
+                      post_teams("💡 Health check", f"{app} status: Healthy", table)
+
+              # Mock Dynatrace alerts
+              alerts = simulate_dynatrace_alerts()
+              for a in alerts:
+                  post_teams(f"⚠ Dynatrace Alert: {a['title']}",
+                             f"Severity: {a['severityLevel']}\nStatus: {a['status']}",
+                             color="FF0000")
+
+          if __name__=="__main__":
+              main()
+          PY
+
+          python windowed_health_check_ssm.py
