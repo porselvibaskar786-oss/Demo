@@ -1,155 +1,92 @@
-name: Patching Control + Teams + Dynatrace Success Alert
+...
+- name: Patching + Teams + Dynatrace Automation
+  run: |
+    python <<'PY'
+    import os, pandas as pd, requests, time, pytz, boto3
+    from datetime import datetime, timedelta
 
-on:
-  workflow_dispatch:
-  schedule:
-    - cron: "*/5 * * * *"  # every 5 minutes
+    FILE = os.getenv("SCHEDULE_FILE")
+    TARGET_ENV = os.getenv("TARGET_ENV")
+    TZ = pytz.timezone(os.getenv("TZ"))
+    TEAMS_URL = os.getenv("TEAMS_WEBHOOK_URL")
+    EC2_INSTANCE_ID = os.getenv("EC2_INSTANCE_ID")
+    AWS_REGION = os.getenv("AWS_REGION")
+    DYNATRACE_ENV_ID = os.getenv("DYNATRACE_ENV_ID")
+    DYNATRACE_API_TOKEN = os.getenv("DYNATRACE_API_TOKEN")
 
-jobs:
-  patching-check:
-    runs-on: ubuntu-latest
+    ssm = boto3.client("ssm", region_name=AWS_REGION)
 
-    env:
-      SCHEDULE_FILE: schedule.csv   # Can be CSV or XLSX
-      TARGET_ENV: Production
-      TZ: Asia/Kolkata
-      TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
-      AWS_REGION: ${{ secrets.AWS_REGION }}
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
-      DYNATRACE_ENV_ID: ${{ secrets.DYNATRACE_ENV_ID }}
-      DYNATRACE_API_TOKEN: ${{ secrets.DYNATRACE_API_TOKEN }}
+    def post_teams(msg, level="Info"):
+        if not TEAMS_URL: return
+        payload = {
+            "@type": "MessageCard",
+            "@context": "http://schema.org/extensions",
+            "themeColor": "0076D7" if level.lower()=="info" else "FF0000",
+            "summary": f"{level}: {msg}",
+            "sections": [{"activityTitle": f"**{level}**", "text": msg}],
+        }
+        try: requests.post(TEAMS_URL, json=payload, timeout=10)
+        except: pass
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+    # --- Load file and normalize headers ---
+    ext = os.path.splitext(FILE)[1].lower()
+    if ext == ".csv":
+        df = pd.read_csv(FILE)
+    else:
+        df = pd.read_excel(FILE)
+    # normalize: remove extra spaces & lowercase
+    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
+    post_teams(f"📋 Patching Schedule:\n{df.to_string(index=False)}")
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+    now = datetime.now(TZ)
 
-      - name: Install Python dependencies
-        run: |
-          pip install --upgrade pip
-          pip install pandas requests pytz boto3 openpyxl
+    for idx,row in df.iterrows():
+        try:
+            app = row['app_name'] if 'app_name' in row else row['app']
+            env = row['environment'] if 'environment' in row else row['env']
+            if env != TARGET_ENV: continue
 
-      - name: Patching + Teams + Dynatrace Automation
-        run: |
-          python <<'PY'
-          import os, pandas as pd, requests, time, pytz, boto3
-          from datetime import datetime, timedelta
+            # normalized columns
+            start = TZ.localize(pd.to_datetime(row['start_date']))
+            stop  = TZ.localize(pd.to_datetime(row['stop_date']))
+            cmd = row['command']
+            iid = row.get('instanceid') or EC2_INSTANCE_ID
+            url = row.get('health_url') or row.get('healthurl')
 
-          FILE = os.getenv("SCHEDULE_FILE")
-          TARGET_ENV = os.getenv("TARGET_ENV")
-          TZ = pytz.timezone(os.getenv("TZ"))
-          TEAMS_URL = os.getenv("TEAMS_WEBHOOK_URL")
-          EC2_INSTANCE_ID = os.getenv("EC2_INSTANCE_ID")
-          AWS_REGION = os.getenv("AWS_REGION")
-          DYNATRACE_ENV_ID = os.getenv("DYNATRACE_ENV_ID")
-          DYNATRACE_API_TOKEN = os.getenv("DYNATRACE_API_TOKEN")
+            # Reminder + Auto-approval
+            if timedelta(minutes=0) <= (start-now) <= timedelta(minutes=5):
+                post_teams(f"⏰ Reminder: Patching starts in 5 min for {app}")
+            post_teams(f"✅ Auto-approved: {app} ready for patching")
 
-          ssm = boto3.client("ssm", region_name=AWS_REGION)
+            # Patch inside window
+            if start <= now <= stop:
+                post_teams(f"🛑 Patching started for {app}")
+                # SSM command
+                try:
+                    resp = ssm.send_command(
+                        InstanceIds=[iid],
+                        DocumentName="AWS-RunShellScript",
+                        Parameters={"commands":[cmd]},
+                        TimeoutSeconds=60
+                    )
+                    post_teams(f"✅ Patching done for {app}")
+                except Exception as e:
+                    post_teams(f"❌ Patching failed for {app}: {e}", "Alert")
+                    continue
 
-          def post_teams(msg, level="Info"):
-              if not TEAMS_URL: return
-              payload = {
-                  "@type": "MessageCard",
-                  "@context": "http://schema.org/extensions",
-                  "themeColor": "0076D7" if level.lower()=="info" else "FF0000",
-                  "summary": f"{level}: {msg}",
-                  "sections": [{"activityTitle": f"**{level}**", "text": msg}],
-              }
-              try: requests.post(TEAMS_URL, json=payload, timeout=10)
-              except: pass
+                # Health check
+                if url:
+                    try:
+                        status = requests.get(url, timeout=5).status_code
+                        if status==200:
+                            post_teams(f"💚 {app} healthy after patching")
+                        else:
+                            post_teams(f"⚠ {app} unhealthy after patching (status {status})")
+                    except: post_teams(f"⚠ {app} health check failed")
+            else:
+                post_teams(f"⏸ Outside patch window for {app}")
 
-          def ssm_run(iid, cmd):
-              try:
-                  resp = ssm.send_command(
-                      InstanceIds=[iid],
-                      DocumentName="AWS-RunShellScript",
-                      Parameters={"commands":[cmd]},
-                      TimeoutSeconds=60
-                  )
-                  cmd_id = resp["Command"]["CommandId"]
-                  for _ in range(60):
-                      out = ssm.get_command_invocation(CommandId=cmd_id, InstanceId=iid)
-                      if out["Status"] in ("Success","Failed","Cancelled","TimedOut"):
-                          return out["Status"]=="Success"
-                      time.sleep(1)
-              except Exception as e:
-                  post_teams(f"SSM error: {e}", "Alert")
-              return False
-
-          def health_check(url):
-              try: return requests.get(url, timeout=5).status_code==200
-              except: return False
-
-          def send_dynatrace_success(app):
-              try:
-                  url = f"https://{DYNATRACE_ENV_ID}.live.dynatrace.com/api/v2/events"
-                  headers = {"Authorization": f"Api-Token {DYNATRACE_API_TOKEN}", "Content-Type": "application/json"}
-                  payload = {
-                      "eventType": "CUSTOM_ANNOTATION",
-                      "attachRules": {"entityIds": []},
-                      "source": "PatchingAutomation",
-                      "annotationType": "Success",
-                      "description": f"{app} patching succeeded"
-                  }
-                  requests.post(url, headers=headers, json=payload, timeout=10)
-              except Exception as e:
-                  post_teams(f"Dynatrace success alert failed: {e}", "Alert")
-
-          # --- Load file ---
-          ext = os.path.splitext(FILE)[1].lower()
-          if ext == ".csv":
-              df = pd.read_csv(FILE)
-          else:
-              df = pd.read_excel(FILE)
-
-          post_teams(f"📋 Patching Schedule:\n{df.to_string(index=False)}")
-
-          now = datetime.now(TZ)
-
-          for idx,row in df.iterrows():
-              app = row['App Name']
-              env = row['Environment']
-              if env != TARGET_ENV: continue
-
-              start = TZ.localize(pd.to_datetime(row['start Date']))
-              stop  = TZ.localize(pd.to_datetime(row['stop Date']))
-              cmd = row['Command']
-              iid = row.get('InstanceID') or EC2_INSTANCE_ID
-              url = row.get('health URL')
-
-              # Reminder 5 minutes before patching
-              if timedelta(minutes=0) <= (start-now) <= timedelta(minutes=5):
-                  post_teams(f"⏰ Reminder: Patching starts in 5 min for {app}")
-
-              # Auto-Approval
-              post_teams(f"✅ Auto-approved: {app} ready for patching")
-
-              # Patch inside window
-              if start <= now <= stop:
-                  post_teams(f"🛑 Patching started for {app}")
-                  if ssm_run(iid, cmd):
-                      post_teams(f"✅ Patching done for {app}")
-                      if url and health_check(url):
-                          post_teams(f"💚 {app} healthy after patching")
-                      else:
-                          post_teams(f"⚠ {app} unhealthy after patching")
-                      send_dynatrace_success(app)
-                  else:
-                      post_teams(f"❌ Patching failed for {app}", "Alert")
-              else:
-                  post_teams(f"⏸ Outside patch window for {app}")
-
-          PY
+        except Exception as e:
+            post_teams(f"❌ Unexpected error processing row: {e}", "Alert")
+    PY
