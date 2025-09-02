@@ -42,9 +42,9 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install boto3 requests pandas openpyxl pytz tabulate
+          pip install boto3 requests pandas openpyxl pytz tabulate flask
 
-      - name: Run Patching Script with Alias Mapping
+      - name: Run Patching Script with Teams Approval
         run: |
           cat > windowed_health_check_ssm.py <<'PY'
           import os, re, time, random
@@ -81,10 +81,18 @@ jobs:
                       return str(v).strip()
               return ""
 
-          def post_teams(title, message, table=None, color="0076D7"):
+          def post_teams(title, message, table=None, approve_url=None, color="0076D7"):
               if not TEAMS_URL: return
               sections = [{"activityTitle": title, "text": message}]
               if table: sections.append({"text": table})
+              if approve_url:
+                  sections.append({
+                      "potentialAction": [{
+                          "@type": "OpenUri",
+                          "name": "Approve",
+                          "targets": [{"os": "default", "uri": approve_url}]
+                      }]
+                  })
               payload = {
                   "@type": "MessageCard",
                   "@context": "http://schema.org/extensions",
@@ -159,19 +167,15 @@ jobs:
 
                   table = make_table(df)
 
-                  # 1-week reminder
-                  if start - timedelta(days=7) <= now < start - timedelta(days=6, hours=23, minutes=55):
-                      post_teams("⏰ Reminder: Patching in 1 week",
-                                 f"Patching for **{app}**. Owner: {owner}", table)
-                      continue
-
-                  # 5-min reminder + approval simulation
-                  if start - timedelta(minutes=5) <= now < start - timedelta(minutes=4, seconds=55):
-                      post_teams("⏰ Reminder: Patching starts in 5 minutes",
-                                 f"Patching for **{app}**. Owner: {owner}\nMock Approval: setting status to 'approved'",
-                                 table)
-                      df.at[idx,"approval_status"]="approved"
-                      save_rows(df)
+                  # 30-min approval request
+                  if start - timedelta(minutes=30) <= now < start - timedelta(minutes=29, seconds=55):
+                      approve_link = f"https://your-server.com/approve?app={app}&idx={idx}"
+                      post_teams(
+                          "📝 Approval required for patching",
+                          f"Patching for **{app}** (Owner: {owner}) is about to start. Please click Approve to continue.",
+                          table,
+                          approve_url=approve_link
+                      )
                       continue
 
                   # Post-approval patching
