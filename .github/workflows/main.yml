@@ -48,7 +48,6 @@ jobs:
           import os, time, requests, pandas as pd, boto3, pytz
           from datetime import datetime, timedelta
 
-          # Environment variables
           CSV_PATH = os.getenv("CSV_PATH")
           TARGET_ENV = os.getenv("TARGET_ENV")
           TZ = pytz.timezone(os.getenv("TZ"))
@@ -60,18 +59,13 @@ jobs:
 
           ssm = boto3.client("ssm", region_name=AWS_REGION)
 
-          # Helper functions
           def post_teams(msg, level="Info"):
-              if not TEAMS_URL:
-                  print(msg)
-                  return
-              payload = {
-                  "@type": "MessageCard",
-                  "@context": "http://schema.org/extensions",
-                  "themeColor": "0076D7" if level.lower()=="info" else "FF0000",
-                  "summary": f"{level}: {msg}",
-                  "sections": [{"activityTitle": f"**{level}**", "text": msg}],
-              }
+              if not TEAMS_URL: print(msg); return
+              payload = {"@type": "MessageCard",
+                         "@context": "http://schema.org/extensions",
+                         "themeColor": "0076D7" if level.lower()=="info" else "FF0000",
+                         "summary": f"{level}: {msg}",
+                         "sections": [{"activityTitle": f"**{level}**", "text": msg}]}
               try: requests.post(TEAMS_URL, json=payload, timeout=10)
               except Exception as e: print(f"[teams] failed: {e}")
 
@@ -113,7 +107,6 @@ jobs:
               except: pass
               return False
 
-          # Dynatrace alerts
           def send_dynatrace_success(app):
               if not DYNATRACE_ENV_ID or not DYNATRACE_API_TOKEN: return
               try:
@@ -122,8 +115,7 @@ jobs:
                   payload = {"eventType":"CUSTOM_ANNOTATION","attachRules":{"entityIds":[]},
                              "source":"GitHub Actions","description":f"Patching successful: {app}"}
                   requests.post(url, headers=headers, json=payload, timeout=5)
-              except Exception as e:
-                  print(f"[dynatrace] failed success alert: {e}")
+              except: pass
 
           def send_dynatrace_failure(app, msg):
               if not DYNATRACE_ENV_ID or not DYNATRACE_API_TOKEN: return
@@ -133,79 +125,66 @@ jobs:
                   payload = {"eventType":"CUSTOM_ALERT","attachRules":{"entityIds":[]},
                              "source":"GitHub Actions","description":f"Patching FAILED: {app} - {msg}"}
                   requests.post(url, headers=headers, json=payload, timeout=5)
-              except Exception as e:
-                  print(f"[dynatrace] failed failure alert: {e}")
+              except: pass
 
-          # Load CSV
           df = pd.read_csv(CSV_PATH)
           df.columns = [c.strip().lower().replace(" ","_") for c in df.columns]
           now = datetime.now(TZ)
 
-          # Step 1: Post dummy message - patching scheduled
+          # Notify scheduled patching
           for idx,row in df.iterrows():
-              app = row['app_name']
-              post_teams(f"📌 Patching scheduled for {app} at {now.strftime('%H:%M:%S')}", "Info")
+              post_teams(f"📌 Patching scheduled for {row['app_name']} at {now.strftime('%H:%M:%S')}")
 
-          # Step 2: Auto-approve pending approvals
+          # Auto-approve pending
           for i, row in df.iterrows():
-              if row.get('approval_status','pending').lower() == 'pending':
-                  df.at[i,'approval_status'] = 'approved'
-                  post_teams(f"✅ Auto-approved {row['app_name']} for patching", "Info")
-
-              # Update start/stop times
+              if row.get('approval_status','pending').lower()=='pending':
+                  df.at[i,'approval_status']='approved'
+                  post_teams(f"✅ Auto-approved {row['app_name']} for patching")
               df.at[i,'start_date'] = (now + timedelta(seconds=10)).strftime("%Y-%m-%d %H:%M:%S")
               df.at[i,'stop_date']  = (now + timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")
-
           df.to_csv(CSV_PATH,index=False)
 
-          # Step 3: Run patching workflow
+          # Run patching
           for idx,row in df.iterrows():
               try:
                   app = row['app_name']
                   env = row['environment']
                   if env != TARGET_ENV: continue
-                  start = pd.to_datetime(row['start_date'])
-                  stop  = pd.to_datetime(row['stop_date'])
-                  cmd = row['command']
                   iid = row.get('instanceid') or EC2_INSTANCE_ID
                   url = row.get('health_url')
-
-                  if start.tzinfo is None: start = TZ.localize(start)
-                  if stop.tzinfo is None: stop = TZ.localize(stop)
 
                   if not ensure_online(iid):
                       post_teams(f"❌ {app}: {iid} not online in SSM","Alert")
                       send_dynatrace_failure(app, "SSM instance not online")
                       continue
 
-                  if start <= now <= stop:
-                      # Stop command during patching window
-                      stop_cmd = cmd.replace("start","stop")
-                      post_teams(f"🛑 Patching window active for {app} on {iid}: `{stop_cmd}`","Info")
-                      rc, out, err = ssm_run(iid, stop_cmd)
-                      if rc != 0:
-                          post_teams(f"❌ Stop failed for {app} on {iid}: {err or out}","Alert")
-                          send_dynatrace_failure(app, err or out)
-                  else:
-                      # Start / patching command
-                      post_teams(f"▶️ Starting {app} on {iid}: `{cmd}`","Info")
-                      rc, out, err = ssm_run(iid, cmd)
-                      if rc != 0: 
-                          post_teams(f"❌ Start failed for {app} on {iid}: {err or out}","Alert")
-                          send_dynatrace_failure(app, err or out)
-                          continue
+                  # Stop app
+                  post_teams(f"🛑 Stopping {app} on {iid}","Info")
+                  rc, out, err = ssm_run(iid, "docker stop $(docker ps -q)")
+                  if rc !=0:
+                      post_teams(f"❌ Failed to stop {app}","Alert")
+                      send_dynatrace_failure(app, "Stop failed")
+                      continue
 
-                      # Wait & health check
-                      time.sleep(8)
-                      status,_ = http_status_via_ssm(iid, url)
-                      if status == 200:
-                          post_teams(f"✅ {app} healthy after patching","Info")
-                          send_dynatrace_success(app)
-                      else:
-                          post_teams(f"❌ {app} NOT healthy after patching (status {status})","Alert")
-                          send_dynatrace_failure(app, f"Health check returned {status}")
+                  # Restart app
+                  post_teams(f"🔄 Restarting {app} on {iid}","Info")
+                  rc, out, err = ssm_run(iid, "docker start $(docker ps -a -q)")
+                  if rc !=0:
+                      post_teams(f"❌ Failed to restart {app}","Alert")
+                      send_dynatrace_failure(app, "Restart failed")
+                      continue
+
+                  # Health check
+                  time.sleep(8)
+                  status,_ = http_status_via_ssm(iid, url)
+                  if status==200:
+                      post_teams(f"✅ {app} healthy after patching","Info")
+                      send_dynatrace_success(app)
+                  else:
+                      post_teams(f"❌ {app} NOT healthy after patching (status {status})","Alert")
+                      send_dynatrace_failure(app,f"Health check returned {status}")
 
               except Exception as e:
-                  post_teams(f"❌ Unexpected error for row {idx}: {e}","Alert")
-                  send_dynatrace_failure(app, str(e))
+                  post_teams(f"❌ Unexpected error for {app}: {e}","Alert")
+                  send_dynatrace_failure(app,str(e))
           PY
