@@ -31,169 +31,96 @@ jobs:
       - name: Install dependencies
         run: pip install pandas requests pytz boto3
 
-      - name: Step 1: Send Schedule CSV
+      - name: Run Patching + Health Checks + Self-Healing
         run: |
           python <<'PY'
-          import pandas as pd, os, requests
-          TEAMS_URL = os.getenv("TEAMS_WEBHOOK_URL")
-          CSV_PATH = os.getenv("CSV_PATH")
-
-          df = pd.read_csv(CSV_PATH)
-          text = "📋 Patching Schedule:\n" + df.to_string(index=False)
-          requests.post(TEAMS_URL, json={"text": text})
-          PY
-
-      - name: Step 2: Reminder Before Patching
-        run: |
-          python <<'PY'
-          import pandas as pd, os, requests, pytz
+          import os, pandas as pd, requests, pytz, time, boto3
           from datetime import datetime, timedelta
-          TEAMS_URL = os.getenv("TEAMS_WEBHOOK_URL")
-          CSV_PATH = os.getenv("CSV_PATH")
-          TZ = pytz.timezone(os.getenv("TZ"))
-          TARGET_ENV = os.getenv("TARGET_ENV")
 
-          df = pd.read_csv(CSV_PATH)
-          now = datetime.now(TZ)
-
-          for idx,row in df.iterrows():
-              if row['Environment'] != TARGET_ENV: continue
-              start = TZ.localize(datetime.strptime(row['start Date'],"%d-%m-%Y %H:%M:%S"))
-              if start - timedelta(minutes=5) <= now < start:
-                  msg = f"⏰ Reminder: Patching starts in 5 minutes for {row['App Name']} (Owner: {row['Owner']})"
-                  requests.post(TEAMS_URL, json={"text": msg})
-          PY
-
-      - name: Step 2a: Auto-Approval
-        run: |
-          python <<'PY'
-          import pandas as pd, os, requests
-          TEAMS_URL = os.getenv("TEAMS_WEBHOOK_URL")
-          CSV_PATH = os.getenv("CSV_PATH")
-
-          df = pd.read_csv(CSV_PATH)
-          changed = False
-          for idx,row in df.iterrows():
-              if str(row.get("approval_status","")).lower() != "approved":
-                  df.at[idx,"approval_status"] = "approved"
-                  requests.post(TEAMS_URL,json={"text":f"✅ Auto-approved: {row['App Name']} will start patching automatically."})
-                  changed = True
-          if changed:
-              df.to_csv(CSV_PATH, index=False)
-          PY
-
-      - name: Step 3: Patching Started + Health Check + Restart
-        run: |
-          python <<'PY'
-          import pandas as pd, os, requests, time, pytz, boto3
-          from datetime import datetime
+          # --- ENV ---
           TEAMS_URL = os.getenv("TEAMS_WEBHOOK_URL")
           CSV_PATH = os.getenv("CSV_PATH")
           TZ = pytz.timezone(os.getenv("TZ"))
           TARGET_ENV = os.getenv("TARGET_ENV")
           EC2_INSTANCE_ID = os.getenv("EC2_INSTANCE_ID")
           AWS_REGION = os.getenv("AWS_REGION")
+          DYNATRACE_ENV_ID = os.getenv("DYNATRACE_ENV_ID")
+          DYNATRACE_API_TOKEN = os.getenv("DYNATRACE_API_TOKEN")
+
           ssm = boto3.client("ssm", region_name=AWS_REGION)
 
+          # --- FUNCTIONS ---
+          def post(msg): 
+              if TEAMS_URL:
+                  requests.post(TEAMS_URL, json={"text": msg})
+
           def restart(cmd):
-              return ssm.send_command(
-                  InstanceIds=[EC2_INSTANCE_ID],
-                  DocumentName="AWS-RunShellScript",
-                  Parameters={"commands":[cmd]},
-                  TimeoutSeconds=60
-              )
+              if cmd and cmd != "-":
+                  return ssm.send_command(
+                      InstanceIds=[EC2_INSTANCE_ID],
+                      DocumentName="AWS-RunShellScript",
+                      Parameters={"commands":[cmd]},
+                      TimeoutSeconds=60
+                  )
 
           def health_check(url):
-              try: return requests.get(url, timeout=5).status_code == 200
-              except: return False
+              try:
+                  return requests.get(url, timeout=5).status_code == 200
+              except:
+                  return False
 
+          # --- Load schedule CSV ---
           df = pd.read_csv(CSV_PATH)
           now = datetime.now(TZ)
 
+          # --- Step 1: Send schedule CSV ---
+          post("📋 Patching Schedule:\n" + df.to_string(index=False))
+
+          # --- Step 2: 5-min Reminder & Auto-Approval ---
+          for idx,row in df.iterrows():
+              if row['Environment'] != TARGET_ENV: continue
+              start = TZ.localize(datetime.strptime(row['start Date'],"%d-%m-%Y %H:%M:%S"))
+
+              # 5-min reminder
+              if start - timedelta(minutes=5) <= now < start:
+                  post(f"⏰ Reminder: Patching starts in 5 minutes for {row['App Name']} (Owner: {row['Owner']})")
+
+              # Auto-approval
+              approval = str(row.get("approval_status","")).lower()
+              if approval != "approved":
+                  df.at[idx,"approval_status"] = "approved"
+                  post(f"✅ Auto-approved: {row['App Name']} will start patching automatically.")
+
+          df.to_csv(CSV_PATH, index=False)
+
+          # --- Step 3: Patching and Health Check ---
           for idx,row in df.iterrows():
               if row['Environment'] != TARGET_ENV: continue
               start = TZ.localize(datetime.strptime(row['start Date'],"%d-%m-%Y %H:%M:%S"))
               stop  = TZ.localize(datetime.strptime(row['stop Date'],"%d-%m-%Y %H:%M:%S"))
               approval = str(row.get("approval_status","")).lower()
-              if start <= now <= stop and approval=="approved":
-                  requests.post(TEAMS_URL,json={"text":f"🛑 Patching started for {row['App Name']} (Owner: {row['Owner']})"})
-                  time.sleep(2)
-                  url = row['health URL']
-                  cmd = row['Command']
-                  if health_check(url):
-                      requests.post(TEAMS_URL,json={"text":f"💚 Health check passed: {row['App Name']} is healthy"})
-                  else:
-                      requests.post(TEAMS_URL,json={"text":f"❌ Health failed: {row['App Name']}. Restarting via SSM..."})
-                      if cmd != "-": restart(cmd)
-                      time.sleep(5)
-                      if health_check(url):
-                          requests.post(TEAMS_URL,json={"text":f"💚 Health restored: {row['App Name']} is healthy after restart"})
-                      else:
-                          requests.post(TEAMS_URL,json={"text":f"⚠ Still unhealthy: {row['App Name']} failed recovery"})
-          PY
-
-      - name: Step 4: Health Check Outside Window + Simulate Restart
-        run: |
-          python <<'PY'
-          import pandas as pd, os, requests, pytz, time, random
-          from datetime import datetime
-          import boto3
-          TEAMS_URL = os.getenv("TEAMS_WEBHOOK_URL")
-          CSV_PATH = os.getenv("CSV_PATH")
-          TZ = pytz.timezone(os.getenv("TZ"))
-          EC2_INSTANCE_ID = os.getenv("EC2_INSTANCE_ID")
-          AWS_REGION = os.getenv("AWS_REGION")
-          ssm = boto3.client("ssm", region_name=AWS_REGION)
-
-          def restart(cmd):
-              return ssm.send_command(InstanceIds=[EC2_INSTANCE_ID],DocumentName="AWS-RunShellScript",Parameters={"commands":[cmd]},TimeoutSeconds=60)
-          def health_check(url):
-              try: return requests.get(url, timeout=5).status_code == 200
-              except: return False
-
-          df = pd.read_csv(CSV_PATH)
-          now = datetime.now(TZ)
-
-          for idx,row in df.iterrows():
-              start = TZ.localize(datetime.strptime(row['start Date'],"%d-%m-%Y %H:%M:%S"))
-              stop  = TZ.localize(datetime.strptime(row['stop Date'],"%d-%m-%Y %H:%M:%S"))
               url = row['health URL']
               cmd = row['Command']
-              if now < start or now > stop:
+              app = row['App Name']
+
+              # Inside window: patching
+              if start <= now <= stop and approval=="approved":
+                  post(f"🛑 Patching started for {app} (Owner: {row['Owner']})")
+                  time.sleep(2)
                   if health_check(url):
-                      requests.post(TEAMS_URL,json={"text":f"💡 Health check: {row['App Name']} is healthy"})
-                      if random.choice([True,False]):
-                          requests.post(TEAMS_URL,json={"text":f"🔄 Simulate stop & restart: {row['App Name']}"})
-                          if cmd != "-": restart(cmd)
-                          time.sleep(5)
-                          if health_check(url):
-                              requests.post(TEAMS_URL,json={"text":f"💚 Health restored: {row['App Name']} after restart"})
-                          else:
-                              requests.post(TEAMS_URL,json={"text":f"⚠ Still unhealthy: {row['App Name']} failed recovery"})
+                      post(f"💚 Health check passed: {app} is healthy")
                   else:
-                      requests.post(TEAMS_URL,json={"text":f"⚠ Health check failed outside window: {row['App Name']} is unhealthy"})
-          PY
+                      post(f"❌ Health failed: {app}. Restarting via SSM...")
+                      restart(cmd)
+                      time.sleep(5)
+                      if health_check(url):
+                          post(f"💚 Health restored: {app} is healthy after restart")
+                      else:
+                          post(f"⚠ Still unhealthy: {app} failed recovery")
 
-      - name: Step 5: Dynatrace Alerts
-        run: |
-          python <<'PY'
-          import os, requests
-          DYNATRACE_ENV_ID = os.getenv("DYNATRACE_ENV_ID")
-          DYNATRACE_API_TOKEN = os.getenv("DYNATRACE_API_TOKEN")
-          TEAMS_URL = os.getenv("TEAMS_WEBHOOK_URL")
-
-          def post(text): requests.post(TEAMS_URL,json={"text":text})
-
-          try:
-              url=f"https://{DYNATRACE_ENV_ID}.live.dynatrace.com/api/v2/problems"
-              headers={"Authorization":f"Api-Token {DYNATRACE_API_TOKEN}","Accept":"application/json"}
-              params={"status":"OPEN","from":"now-30m","fields":"title,severity,affectedEntities"}
-              r = requests.get(url, headers=headers, params=params, timeout=10)
-              r.raise_for_status()
-              problems = r.json().get("problems",[])
-              for p in problems:
-                  entities=", ".join([e['entityId'] for e in p.get("affectedEntities",[])])
-                  post(f"⚠ Dynatrace Alert: {p['title']}\nSeverity: {p['severity']}\nAffected Entities: {entities}")
-          except Exception as e:
-              post(f"Dynatrace fetch failed: {e}")
-          PY
+              # Outside window: normal health check + self-healing
+              elif now < start or now > stop:
+                  attempt = 1
+                  while True:
+                      if health_check(url):
+                          post(f"💡 Health check: {app} is
